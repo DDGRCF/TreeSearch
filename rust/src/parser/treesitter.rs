@@ -1,3 +1,5 @@
+//! Parses supported source files into stable syntax-aware document trees.
+
 use crate::document::{Document, Node, SourceType};
 use anyhow::Result;
 use regex::Regex;
@@ -12,11 +14,63 @@ pub struct TreeSitterParser;
 
 /// File extensions handled by this parser (all source code files).
 const CODE_EXTENSIONS: &[&str] = &[
-    "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "cs", "rb",
-    "php", "swift", "kt", "scala", "sh", "bash", "zsh", "fish", "lua", "r", "m", "mm", "pl",
-    "pm", "ex", "exs", "erl", "hs", "ml", "mli", "clj", "cljs", "el", "vim", "sql", "graphql",
-    "proto", "tf", "hcl", "zig", "nim", "v", "d", "dart", "cmake", "makefile", "dockerfile",
-    "css", "scss", "sass", "less", "vue", "svelte",
+    "rs",
+    "py",
+    "js",
+    "ts",
+    "jsx",
+    "tsx",
+    "go",
+    "java",
+    "c",
+    "cpp",
+    "h",
+    "hpp",
+    "cs",
+    "rb",
+    "php",
+    "swift",
+    "kt",
+    "scala",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "lua",
+    "r",
+    "m",
+    "mm",
+    "pl",
+    "pm",
+    "ex",
+    "exs",
+    "erl",
+    "hs",
+    "ml",
+    "mli",
+    "clj",
+    "cljs",
+    "el",
+    "vim",
+    "sql",
+    "graphql",
+    "proto",
+    "tf",
+    "hcl",
+    "zig",
+    "nim",
+    "v",
+    "d",
+    "dart",
+    "cmake",
+    "makefile",
+    "dockerfile",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "vue",
+    "svelte",
 ];
 
 impl super::Parser for TreeSitterParser {
@@ -117,10 +171,7 @@ fn detect_boundaries(content: &str, ext: &str) -> Vec<Boundary> {
         return Vec::new();
     }
 
-    let regexes: Vec<Regex> = patterns
-        .iter()
-        .filter_map(|p| Regex::new(p).ok())
-        .collect();
+    let regexes: Vec<Regex> = patterns.iter().filter_map(|p| Regex::new(p).ok()).collect();
 
     let mut boundaries = Vec::new();
 
@@ -158,10 +209,7 @@ fn get_patterns(ext: &str) -> Vec<&'static str> {
             r"^\s*(?:pub\s+)?mod\s+(\w+)",
         ],
         // Python
-        "py" => vec![
-            r"^(?:async\s+)?def\s+(\w+)",
-            r"^class\s+(\w+)",
-        ],
+        "py" => vec![r"^(?:async\s+)?def\s+(\w+)", r"^class\s+(\w+)"],
         // JavaScript / TypeScript
         "js" | "jsx" | "ts" | "tsx" | "vue" | "svelte" => vec![
             r"^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)",
@@ -213,23 +261,15 @@ fn get_patterns(ext: &str) -> Vec<&'static str> {
             r"^\s*(?:public|private|internal|open|fileprivate)?\s*protocol\s+(\w+)",
         ],
         // Lua
-        "lua" => vec![
-            r"^\s*(?:local\s+)?function\s+(\w[\w.:]*)",
-        ],
+        "lua" => vec![r"^\s*(?:local\s+)?function\s+(\w[\w.:]*)"],
         // Shell
-        "sh" | "bash" | "zsh" | "fish" => vec![
-            r"^\s*(?:function\s+)?(\w+)\s*\(\)",
-            r"^\s*function\s+(\w+)",
-        ],
+        "sh" | "bash" | "zsh" | "fish" => {
+            vec![r"^\s*(?:function\s+)?(\w+)\s*\(\)", r"^\s*function\s+(\w+)"]
+        }
         // Elixir
-        "ex" | "exs" => vec![
-            r"^\s*def[p]?\s+(\w+)",
-            r"^\s*defmodule\s+(\w[\w.]*)",
-        ],
+        "ex" | "exs" => vec![r"^\s*def[p]?\s+(\w+)", r"^\s*defmodule\s+(\w[\w.]*)"],
         // Haskell
-        "hs" => vec![
-            r"^(\w+)\s+::",
-        ],
+        "hs" => vec![r"^(\w+)\s+::"],
         // SQL
         "sql" => vec![
             r"(?i)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|FUNCTION|PROCEDURE|INDEX)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
@@ -256,8 +296,8 @@ fn get_patterns(ext: &str) -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::Parser;
     use super::*;
+    use crate::parser::Parser;
 
     fn parse_code(content: &str, filename: &str) -> Document {
         let parser = TreeSitterParser;
@@ -366,7 +406,8 @@ mod tests {
 
     #[test]
     fn test_shell() {
-        let content = "#!/bin/bash\n\nhello() {\n    echo 'hi'\n}\n\nfunction world {\n    echo 'world'\n}\n";
+        let content =
+            "#!/bin/bash\n\nhello() {\n    echo 'hi'\n}\n\nfunction world {\n    echo 'world'\n}\n";
         let doc = parse_code(content, "script.sh");
         let titles: Vec<&str> = doc.structure.iter().map(|n| n.title.as_str()).collect();
         assert!(titles.contains(&"hello"));

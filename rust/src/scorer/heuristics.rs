@@ -27,29 +27,86 @@ pub static STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     let mut s = HashSet::new();
     // English
     for w in &[
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "of", "in", "to", "for",
-        "with", "on", "at", "by", "from", "as", "into", "through", "during",
-        "before", "after", "above", "below", "between", "and", "but", "or",
-        "not", "no", "so", "if", "than", "too", "very", "just", "about",
-        "also", "then", "this", "that", "these", "those", "it", "its",
-        "what", "which", "who", "whom", "how", "when", "where", "why",
-        "all", "each", "every", "both", "few", "more", "most", "other",
-        "some", "such", "only", "own", "same", "we", "they", "he", "she",
-        "us", "our", "their", "your", "my", "i", "me", "you",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "of", "in", "to", "for", "with", "on", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "and", "but", "or", "not", "no",
+        "so", "if", "than", "too", "very", "just", "about", "also", "then", "this", "that",
+        "these", "those", "it", "its", "what", "which", "who", "whom", "how", "when", "where",
+        "why", "all", "each", "every", "both", "few", "more", "most", "other", "some", "such",
+        "only", "own", "same", "we", "they", "he", "she", "us", "our", "their", "your", "my", "i",
+        "me", "you",
     ] {
         s.insert(*w);
     }
     // Chinese
     for w in &[
-        "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
-        "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
-        "会", "着", "没有", "看", "好", "自己", "这", "他", "她", "它",
-        "吗", "吧", "呢", "啊", "呀", "哦", "嗯", "嘛", "哈",
-        "怎样", "怎么", "什么", "哪", "哪个", "哪些", "为什么", "如何",
-        "可以", "能", "把", "被", "让", "给", "对", "从", "向", "跟",
-        "还", "又", "再", "已", "已经", "正在", "将", "将要",
+        "的",
+        "了",
+        "在",
+        "是",
+        "我",
+        "有",
+        "和",
+        "就",
+        "不",
+        "人",
+        "都",
+        "一",
+        "一个",
+        "上",
+        "也",
+        "很",
+        "到",
+        "说",
+        "要",
+        "去",
+        "你",
+        "会",
+        "着",
+        "没有",
+        "看",
+        "好",
+        "自己",
+        "这",
+        "他",
+        "她",
+        "它",
+        "吗",
+        "吧",
+        "呢",
+        "啊",
+        "呀",
+        "哦",
+        "嗯",
+        "嘛",
+        "哈",
+        "怎样",
+        "怎么",
+        "什么",
+        "哪",
+        "哪个",
+        "哪些",
+        "为什么",
+        "如何",
+        "可以",
+        "能",
+        "把",
+        "被",
+        "让",
+        "给",
+        "对",
+        "从",
+        "向",
+        "跟",
+        "还",
+        "又",
+        "再",
+        "已",
+        "已经",
+        "正在",
+        "将",
+        "将要",
     ] {
         s.insert(*w);
     }
@@ -72,9 +129,7 @@ static STRUCT_SIGNALS: LazyLock<Regex> = LazyLock::new(|| {
     ).unwrap()
 });
 
-static QUOTED_PHRASE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""([^"]+)""#).unwrap()
-});
+static QUOTED_PHRASE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]+)""#).unwrap());
 
 // ---------------------------------------------------------------------------
 // Generic Sections
@@ -107,7 +162,7 @@ static GENERIC_SECTIONS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 // ---------------------------------------------------------------------------
 
 /// Structured representation of a parsed query.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryPlan {
     /// Original query string.
     pub raw: String,
@@ -121,18 +176,6 @@ pub struct QueryPlan {
     pub is_structural_query: bool,
 }
 
-impl Default for QueryPlan {
-    fn default() -> Self {
-        Self {
-            raw: String::new(),
-            terms: Vec::new(),
-            phrases: Vec::new(),
-            is_code_query: false,
-            is_structural_query: false,
-        }
-    }
-}
-
 /// Parse a raw query string into a structured [`QueryPlan`].
 ///
 /// Steps:
@@ -141,6 +184,11 @@ impl Default for QueryPlan {
 /// 3. Filter stop words
 /// 4. Detect code / structural intent via regex
 pub fn build_query_plan(query: &str) -> QueryPlan {
+    build_query_plan_with_mode(query, CjkTokenizerMode::Auto)
+}
+
+/// Parses a query using the caller-selected CJK tokenizer policy.
+pub fn build_query_plan_with_mode(query: &str, cjk_mode: CjkTokenizerMode) -> QueryPlan {
     let mut plan = QueryPlan {
         raw: query.to_string(),
         ..Default::default()
@@ -159,7 +207,7 @@ pub fn build_query_plan(query: &str) -> QueryPlan {
     let remaining = remaining.trim();
 
     // 2. Tokenize with CJK support (no stopword removal — we do it ourselves)
-    let tokens = tokenizer::tokenize(remaining, false, CjkTokenizerMode::Auto);
+    let tokens = tokenizer::tokenize(remaining, false, cjk_mode);
     let raw_terms: Vec<String> = tokens
         .into_iter()
         .filter(|t| !t.trim().is_empty())
@@ -170,8 +218,7 @@ pub fn build_query_plan(query: &str) -> QueryPlan {
     plan.terms = raw_terms
         .iter()
         .filter(|t| {
-            !STOP_WORDS.contains(t.as_str())
-                && (t.chars().count() > 1 || tokenizer::has_cjk(t))
+            !STOP_WORDS.contains(t.as_str()) && (t.chars().count() > 1 || tokenizer::has_cjk(t))
         })
         .cloned()
         .collect();
@@ -187,7 +234,18 @@ pub fn build_query_plan(query: &str) -> QueryPlan {
 
     // Build implicit phrase from consecutive terms (2-gram)
     if raw_terms.len() >= 2 && plan.phrases.is_empty() {
-        plan.phrases.push(raw_terms.join(" "));
+        let implicit_phrase = if tokenizer::has_cjk(remaining) {
+            let compact: String = remaining
+                .chars()
+                .filter(|character| character.is_alphanumeric())
+                .collect();
+            trim_boundary_stop_words(compact)
+        } else {
+            raw_terms.join(" ")
+        };
+        if !implicit_phrase.is_empty() {
+            plan.phrases.push(implicit_phrase);
+        }
     }
 
     // 4. Intent detection
@@ -195,6 +253,35 @@ pub fn build_query_plan(query: &str) -> QueryPlan {
     plan.is_structural_query = STRUCT_SIGNALS.is_match(query);
 
     plan
+}
+
+/// Removes deterministic leading/trailing intent stop words from a CJK phrase.
+fn trim_boundary_stop_words(mut phrase: String) -> String {
+    let mut stop_words: Vec<&str> = STOP_WORDS
+        .iter()
+        .copied()
+        .filter(|word| tokenizer::has_cjk(word))
+        .collect();
+    stop_words.sort_by(|left, right| {
+        right
+            .chars()
+            .count()
+            .cmp(&left.chars().count())
+            .then_with(|| left.cmp(right))
+    });
+    loop {
+        let Some(stop_word) = stop_words.iter().find(|word| {
+            phrase.chars().count() > word.chars().count()
+                && (phrase.starts_with(**word) || phrase.ends_with(**word))
+        }) else {
+            return phrase;
+        };
+        phrase = phrase
+            .strip_prefix(*stop_word)
+            .or_else(|| phrase.strip_suffix(*stop_word))
+            .unwrap_or(&phrase)
+            .to_string();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -212,25 +299,39 @@ pub fn compute_term_overlap(
     terms: &[String],
     idf: Option<&HashMap<String, f64>>,
 ) -> f64 {
+    let terms: Vec<&String> = terms
+        .iter()
+        .filter(|term| !term.trim().is_empty())
+        .collect();
     if text.is_empty() || terms.is_empty() {
         return 0.0;
     }
     let text_lower = text.to_lowercase();
 
     if let Some(idf_map) = idf {
-        let total_w: f64 = terms.iter().map(|t| idf_map.get(t).copied().unwrap_or(1.0)).sum();
+        let weight = |term: &str| {
+            idf_map
+                .get(term)
+                .copied()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(1.0)
+        };
+        let total_w: f64 = terms.iter().map(|term| weight(term)).sum();
         if total_w <= 0.0 {
             return 0.0;
         }
         let hit_w: f64 = terms
             .iter()
-            .filter(|t| text_lower.contains(t.as_str()))
-            .map(|t| idf_map.get(t).copied().unwrap_or(1.0))
+            .filter(|term| text_lower.contains(term.as_str()))
+            .map(|term| weight(term))
             .sum();
-        hit_w / total_w
+        (hit_w / total_w).clamp(0.0, 1.0)
     } else {
         // Uniform fallback
-        let matched = terms.iter().filter(|t| text_lower.contains(t.as_str())).count();
+        let matched = terms
+            .iter()
+            .filter(|term| text_lower.contains(term.as_str()))
+            .count();
         matched as f64 / terms.len() as f64
     }
 }
@@ -288,9 +389,10 @@ pub fn score_anchor(
     body_term_overlap: f64,
     max_depth: u32,
 ) -> f64 {
+    let fts_score = normalized_signal(fts_score);
+    let body_term_overlap = normalized_signal(body_term_overlap);
     // Depth penalty: deeper nodes are less ideal as anchors
-    let depth_penalty =
-        (depth as f64 / (max_depth.max(1) as f64)).min(1.0) * 0.10;
+    let depth_penalty = (depth as f64 / (max_depth.max(1) as f64)).min(1.0) * 0.10;
 
     // Title match bonus
     let title_bonus = if has_title_match { 0.15 } else { 0.0 };
@@ -323,6 +425,59 @@ pub fn score_anchor(
 ///   - 0.12 ancestor support
 ///   - -0.08 hop penalty
 ///   - -0.08 redundancy penalty
+#[derive(Debug, Clone, Copy)]
+pub struct WalkScoreInput {
+    pub lexical_score: f64,
+    pub has_title_match: bool,
+    pub has_phrase_match: bool,
+    pub body_term_overlap: f64,
+    pub ancestor_support: f64,
+    pub hop: u32,
+    pub is_redundant: bool,
+    pub max_hops: u32,
+}
+
+/// Combines sanitized lexical, structural, distance, and redundancy signals.
+pub fn score_walk_node_with_input(input: WalkScoreInput) -> f64 {
+    let lexical_score = normalized_signal(input.lexical_score);
+    let body_term_overlap = normalized_signal(input.body_term_overlap);
+    let ancestor_support = normalized_signal(input.ancestor_support);
+    // Base: FTS5 lexical relevance is the primary signal
+    let mut score = 0.45 * lexical_score;
+
+    // Body text content overlap
+    score += 0.15 * body_term_overlap;
+
+    // Title match bonus
+    if input.has_title_match {
+        score += 0.08;
+    }
+
+    // Phrase match bonus
+    if input.has_phrase_match {
+        score += 0.07;
+    }
+
+    // Ancestor support: path consistency
+    score += 0.12 * ancestor_support;
+
+    // Hop penalty: further from anchor = less relevant
+    let hop_ratio = (input.hop as f64 / input.max_hops.max(1) as f64).min(1.0);
+    score -= 0.08 * hop_ratio;
+
+    // Redundancy penalty
+    if input.is_redundant {
+        score -= 0.08;
+    }
+
+    score.clamp(0.0, 1.0)
+}
+
+/// Scores a walk node through the historical positional API.
+///
+/// New integrations should prefer [`score_walk_node_with_input`] so signal
+/// meaning remains explicit at the call site.
+#[allow(clippy::too_many_arguments)]
 pub fn score_walk_node(
     lexical_score: f64,
     has_title_match: bool,
@@ -333,35 +488,16 @@ pub fn score_walk_node(
     is_redundant: bool,
     max_hops: u32,
 ) -> f64 {
-    // Base: FTS5 lexical relevance is the primary signal
-    let mut score = 0.45 * lexical_score;
-
-    // Body text content overlap
-    score += 0.15 * body_term_overlap;
-
-    // Title match bonus
-    if has_title_match {
-        score += 0.08;
-    }
-
-    // Phrase match bonus
-    if has_phrase_match {
-        score += 0.07;
-    }
-
-    // Ancestor support: path consistency
-    score += 0.12 * ancestor_support;
-
-    // Hop penalty: further from anchor = less relevant
-    let hop_ratio = (hop as f64 / max_hops.max(1) as f64).min(1.0);
-    score -= 0.08 * hop_ratio;
-
-    // Redundancy penalty
-    if is_redundant {
-        score -= 0.08;
-    }
-
-    score.max(0.0)
+    score_walk_node_with_input(WalkScoreInput {
+        lexical_score,
+        has_title_match,
+        has_phrase_match,
+        body_term_overlap,
+        ancestor_support,
+        hop,
+        is_redundant,
+        max_hops,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +524,12 @@ pub fn score_path(
     leaf_fts_score: f64,
     max_path_length: usize,
 ) -> f64 {
+    let leaf_score = normalized_signal(leaf_score);
+    let leaf_fts_score = normalized_signal(leaf_fts_score);
+    let query_terms: Vec<&String> = query_terms
+        .iter()
+        .filter(|term| !term.trim().is_empty())
+        .collect();
     // Leaf score dominates (walk-level quality)
     let mut score = 0.30 * leaf_score;
 
@@ -437,6 +579,15 @@ pub fn score_path(
     score.clamp(0.0, 1.0)
 }
 
+/// Converts any external scoring signal into the finite unit interval.
+fn normalized_signal(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Utility: term matching helpers
 // ---------------------------------------------------------------------------
@@ -447,7 +598,9 @@ pub fn check_title_match(title: &str, terms: &[String]) -> bool {
         return false;
     }
     let title_lower = title.to_lowercase();
-    terms.iter().any(|t| title_lower.contains(t.as_str()))
+    terms
+        .iter()
+        .any(|term| !term.trim().is_empty() && title_lower.contains(term.as_str()))
 }
 
 /// Check if any exact phrase appears in the text.
@@ -456,7 +609,9 @@ pub fn check_phrase_match(text: &str, phrases: &[String]) -> bool {
         return false;
     }
     let text_lower = text.to_lowercase();
-    phrases.iter().any(|p| text_lower.contains(&p.to_lowercase()))
+    phrases
+        .iter()
+        .any(|phrase| !phrase.trim().is_empty() && text_lower.contains(&phrase.to_lowercase()))
 }
 
 /// Check if a node is a generic overview section.
@@ -492,6 +647,20 @@ pub fn is_generic_section(title: &str, depth: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Returns neutral walk signals for distance and redundancy comparisons.
+    fn near_input() -> WalkScoreInput {
+        WalkScoreInput {
+            lexical_score: 0.5,
+            has_title_match: false,
+            has_phrase_match: false,
+            body_term_overlap: 0.0,
+            ancestor_support: 0.0,
+            hop: 0,
+            is_redundant: false,
+            max_hops: 3,
+        }
+    }
 
     // -- QueryPlan --
 
@@ -532,6 +701,14 @@ mod tests {
     }
 
     #[test]
+    fn query_plan_honors_explicit_cjk_mode() {
+        let character_plan = build_query_plan_with_mode("知识库", CjkTokenizerMode::Char);
+        assert_eq!(character_plan.terms, vec!["知", "识", "库"]);
+        let bigram_plan = build_query_plan_with_mode("知识库", CjkTokenizerMode::Bigram);
+        assert_eq!(bigram_plan.terms, vec!["知识", "识库"]);
+    }
+
+    #[test]
     fn test_build_query_plan_stop_words_filtered() {
         let plan = build_query_plan("the quick brown fox");
         // "the" is a stop word, should be filtered
@@ -561,6 +738,13 @@ mod tests {
         assert!(plan.phrases[0].contains("machine"));
     }
 
+    #[test]
+    fn cjk_implicit_phrase_matches_unsegmented_text() {
+        let plan = build_query_plan("如何 自行报价？");
+        assert_eq!(plan.phrases, vec!["自行报价"]);
+        assert!(check_phrase_match("用户可以自行报价并提交", &plan.phrases));
+    }
+
     // -- Term overlap --
 
     #[test]
@@ -570,14 +754,8 @@ mod tests {
             compute_term_overlap("hello world example", &terms, None),
             1.0
         );
-        assert_eq!(
-            compute_term_overlap("hello example", &terms, None),
-            0.5
-        );
-        assert_eq!(
-            compute_term_overlap("nothing here", &terms, None),
-            0.0
-        );
+        assert_eq!(compute_term_overlap("hello example", &terms, None), 0.5);
+        assert_eq!(compute_term_overlap("nothing here", &terms, None), 0.0);
     }
 
     #[test]
@@ -585,6 +763,10 @@ mod tests {
         let terms: Vec<String> = vec!["hello".into()];
         assert_eq!(compute_term_overlap("", &terms, None), 0.0);
         assert_eq!(compute_term_overlap("hello", &[], None), 0.0);
+        assert_eq!(
+            compute_term_overlap("anything", &[String::new()], None),
+            0.0
+        );
     }
 
     #[test]
@@ -596,6 +778,33 @@ mod tests {
         // Only "rare" present -> 3.0 / 4.0 = 0.75
         let overlap = compute_term_overlap("this is rare", &terms, Some(&idf));
         assert!((overlap - 0.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn public_scorers_never_return_non_finite_values() {
+        let terms = vec!["query".into()];
+        let invalid_idf = HashMap::from([("query".into(), f64::NAN)]);
+        assert_eq!(
+            compute_term_overlap("query", &terms, Some(&invalid_idf)),
+            1.0
+        );
+        for score in [
+            score_anchor(f64::NAN, 0, false, false, f64::INFINITY, 1),
+            score_walk_node_with_input(WalkScoreInput {
+                lexical_score: f64::NAN,
+                has_title_match: false,
+                has_phrase_match: false,
+                body_term_overlap: f64::INFINITY,
+                ancestor_support: f64::NEG_INFINITY,
+                hop: 0,
+                is_redundant: false,
+                max_hops: 1,
+            }),
+            score_path(f64::NAN, &[], &[], &[], 0, f64::INFINITY, 1),
+        ] {
+            assert!(score.is_finite());
+            assert!((0.0..=1.0).contains(&score));
+        }
     }
 
     // -- IDF estimation --
@@ -669,16 +878,41 @@ mod tests {
 
     #[test]
     fn test_score_walk_node_basic() {
-        let score = score_walk_node(0.8, true, true, 0.5, 0.6, 0, false, 3);
+        let score = score_walk_node_with_input(WalkScoreInput {
+            lexical_score: 0.8,
+            has_title_match: true,
+            has_phrase_match: true,
+            body_term_overlap: 0.5,
+            ancestor_support: 0.6,
+            hop: 0,
+            is_redundant: false,
+            max_hops: 3,
+        });
         // 0.45*0.8 + 0.15*0.5 + 0.08 + 0.07 + 0.12*0.6 - 0.0 - 0.0
         // = 0.36 + 0.075 + 0.08 + 0.07 + 0.072 = 0.657
         assert!((score - 0.657).abs() < 1e-9);
+        assert_eq!(
+            score_walk_node(0.8, true, true, 0.5, 0.6, 0, false, 3),
+            score
+        );
     }
 
     #[test]
     fn test_score_walk_node_hop_penalty() {
-        let near = score_walk_node(0.5, false, false, 0.0, 0.0, 0, false, 3);
-        let far = score_walk_node(0.5, false, false, 0.0, 0.0, 3, false, 3);
+        let near = score_walk_node_with_input(WalkScoreInput {
+            lexical_score: 0.5,
+            has_title_match: false,
+            has_phrase_match: false,
+            body_term_overlap: 0.0,
+            ancestor_support: 0.0,
+            hop: 0,
+            is_redundant: false,
+            max_hops: 3,
+        });
+        let far = score_walk_node_with_input(WalkScoreInput {
+            hop: 3,
+            ..near_input()
+        });
         assert!(near > far);
         // Difference should be 0.08
         assert!((near - far - 0.08).abs() < 1e-9);
@@ -686,15 +920,27 @@ mod tests {
 
     #[test]
     fn test_score_walk_node_redundancy_penalty() {
-        let fresh = score_walk_node(0.5, false, false, 0.0, 0.0, 0, false, 3);
-        let redundant = score_walk_node(0.5, false, false, 0.0, 0.0, 0, true, 3);
+        let fresh = score_walk_node_with_input(near_input());
+        let redundant = score_walk_node_with_input(WalkScoreInput {
+            is_redundant: true,
+            ..near_input()
+        });
         assert!((fresh - redundant - 0.08).abs() < 1e-9);
     }
 
     #[test]
     fn test_score_walk_node_floor() {
         // All penalties, no positive signals -> should floor at 0.0
-        let score = score_walk_node(0.0, false, false, 0.0, 0.0, 3, true, 3);
+        let score = score_walk_node_with_input(WalkScoreInput {
+            lexical_score: 0.0,
+            has_title_match: false,
+            has_phrase_match: false,
+            body_term_overlap: 0.0,
+            ancestor_support: 0.0,
+            hop: 3,
+            is_redundant: true,
+            max_hops: 3,
+        });
         assert_eq!(score, 0.0);
     }
 
@@ -769,6 +1015,7 @@ mod tests {
         assert!(!check_phrase_match("neural net", &phrases));
         assert!(!check_phrase_match("", &phrases));
         assert!(!check_phrase_match("some text", &[]));
+        assert!(!check_phrase_match("some text", &[String::new()]));
     }
 
     // -- Generic section detection --

@@ -1,41 +1,76 @@
+# Change note: forbid unsafe code and keep optional SQLite limited to APIs TreeSearch actually uses.
 [package]
 name = "treesearch"
 version = "1.1.1"
 edition = "2021"
-description = "Structure-aware document search CLI. Fast keyword matching over hierarchical document trees."
+description = "Structure-aware document search library and optional CLI over hierarchical document trees."
 license = "Apache-2.0"
 readme = "README.md"
-homepage = "https://github.com/shibing624/TreeSearch"
+homepage = "https://github.com/DDGRCF/TreeSearch"
 documentation = "https://docs.rs/treesearch"
-repository = "https://github.com/shibing624/TreeSearch"
+repository = "https://github.com/DDGRCF/TreeSearch"
 keywords = ["search", "fts5", "bm25", "tree", "cli"]
 categories = ["command-line-utilities", "text-processing"]
 
 [[bin]]
 name = "ts"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+# Preserve `cargo install treesearch` and the upstream CLI experience by
+# default, while allowing embedding applications to select only what they use.
+default = ["cli"]
+cli = [
+    "cjk-jieba",
+    "directory-indexer",
+    "output",
+    "parsers-all",
+    "progress",
+    "sqlite-bundled",
+    "dep:clap",
+    "dep:tracing-subscriber",
+]
+directory-indexer = ["sqlite-fts", "dep:ignore", "dep:rayon"]
+progress = ["directory-indexer", "dep:indicatif"]
+output = ["dep:serde_json", "dep:termcolor", "dep:unicode-width"]
+sqlite-fts = ["dep:md-5", "dep:rusqlite", "dep:serde_json", "dep:tracing"]
+sqlite-bundled = ["sqlite-fts", "rusqlite/bundled"]
+cjk-jieba = ["dep:jieba-rs", "dep:tracing"]
+parser-markdown = ["dep:pulldown-cmark"]
+parser-plaintext = []
+parser-html = ["dep:ego-tree", "dep:scraper"]
+parser-config = ["dep:serde_json", "dep:serde_yaml", "dep:toml"]
+parser-code = []
+parsers-all = [
+    "parser-code",
+    "parser-config",
+    "parser-html",
+    "parser-markdown",
+    "parser-plaintext",
+]
 
 [dependencies]
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 
 # SQLite + FTS5
-rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+rusqlite = { version = "0.37", default-features = false, optional = true }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-toml = "0.8"
+serde_json = { version = "1", optional = true }
+serde_yaml = { version = "0.9", optional = true }
+toml = { version = "0.8", optional = true }
 
 # File discovery
-ignore = "0.4"
+ignore = { version = "0.4", optional = true }
 
 # Parallel processing
-rayon = "1.10"
+rayon = { version = "1.10", optional = true }
 
 # CJK tokenization
-jieba-rs = "0.7"
+jieba-rs = { version = "0.9", optional = true }
 
 # Regex
 regex = "1"
@@ -45,31 +80,25 @@ thiserror = "1"
 anyhow = "1"
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 # Terminal output
-termcolor = "1"
-unicode-width = "0.1"
+termcolor = { version = "1", optional = true }
+unicode-width = { version = "0.1", optional = true }
 
 # Progress bar
-indicatif = "0.17"
+indicatif = { version = "0.18", optional = true }
 
 # HTML parsing
-scraper = "0.21"
-ego-tree = "0.9"
+scraper = { version = "0.27", optional = true }
+ego-tree = { version = "0.11", optional = true }
 
 # Markdown parsing
-pulldown-cmark = "0.12"
-
-# String matching (aho-corasick for fast multi-pattern search)
-aho-corasick = "1"
+pulldown-cmark = { version = "0.12", optional = true }
 
 # Content hashing
-md-5 = "0.10"
-
-# File locking
-fs2 = "0.4"
+md-5 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -80,3 +109,6 @@ predicates = "3"
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[lints.rust]
+unsafe_code = "forbid"

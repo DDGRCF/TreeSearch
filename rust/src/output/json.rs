@@ -40,8 +40,8 @@ impl OutputFormat for JsonOutput {
             version: SCHEMA_VERSION,
             results,
         };
-        serde_json::to_string_pretty(&envelope).unwrap_or_else(|e| {
-            format!("{{\"error\": \"serialization failed: {}\"}}", e)
+        serde_json::to_string_pretty(&envelope).unwrap_or_else(|error| {
+            serde_json::json!({ "error": format!("serialization failed: {error}") }).to_string()
         })
     }
 }

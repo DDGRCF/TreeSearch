@@ -1,4 +1,4 @@
-//! Search pipeline: FTS5 pre-scoring + mode routing (flat / tree).
+//! Search pipeline with UTF-8-safe query routing and FTS5-backed flat/tree scoring.
 //!
 //! Two-stage pipeline:
 //! 1. FTS5 pre-scoring: batch score all documents
@@ -10,25 +10,9 @@ use anyhow::{bail, Result};
 use regex::{Regex, RegexBuilder};
 
 use crate::config::{SearchMode, TreeSearchConfig};
-use crate::document::{Document, Node, SearchResult, SourceType};
+use crate::document::{Document, Node, SearchResult};
+use crate::engine::candidate_search;
 use crate::engine::fts::FTS5Index;
-use crate::engine::tree_walker::TreeSearcher;
-
-// ---------------------------------------------------------------------------
-// Auto mode constants (ported from Python search.py)
-// ---------------------------------------------------------------------------
-
-/// Which source types benefit from tree walk.
-fn benefits_from_tree(source_type: &SourceType) -> bool {
-    matches!(source_type, SourceType::Markdown | SourceType::Json | SourceType::Yaml | SourceType::Toml | SourceType::Html)
-}
-
-/// Minimum tree depth for a doc to truly benefit from tree walk.
-/// Docs with depth ≤ 1 (flat list of nodes) won't gain anything from BFS walk.
-const MIN_TREE_DEPTH: u32 = 2;
-
-/// If ≥30% of docs benefit from tree, use tree for all.
-const TREE_RATIO_THRESHOLD: f64 = 0.3;
 
 #[derive(Debug, Clone)]
 struct QueryMode {
@@ -57,21 +41,16 @@ fn classify_query_mode(query: &str, fts_expression: Option<&str>, regex: bool) -
         };
     }
     let trimmed = query.trim();
-    let no_internal_star = !trimmed[..trimmed.len().saturating_sub(1)].contains('*');
-    let middle = if trimmed.len() > 2 {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        ""
-    };
-    let prefix_body = if !trimmed.is_empty() {
-        &trimmed[..trimmed.len().saturating_sub(1)]
-    } else {
-        ""
-    };
+    let prefix_body = trimmed.strip_suffix('*').unwrap_or(trimmed);
+    let no_internal_star = !prefix_body.contains('*');
+    let middle = trimmed
+        .strip_prefix('*')
+        .and_then(|value| value.strip_suffix('*'))
+        .unwrap_or("");
 
     if trimmed.starts_with('*')
         && trimmed.ends_with('*')
-        && trimmed.len() > 2
+        && trimmed.chars().count() > 2
         && !middle.contains('*')
         && !middle.chars().any(|c| c.is_whitespace())
     {
@@ -85,7 +64,7 @@ fn classify_query_mode(query: &str, fts_expression: Option<&str>, regex: bool) -
 
     if trimmed.ends_with('*')
         && !trimmed.starts_with('*')
-        && trimmed.len() > 1
+        && trimmed.chars().count() > 1
         && no_internal_star
         && !prefix_body.chars().any(|c| c.is_whitespace())
     {
@@ -112,21 +91,20 @@ fn regex_score_doc(doc: &Document, regex: &Regex) -> HashMap<String, f64> {
         regex.find_iter(text).count()
     }
 
-    fn walk(node: &Node, regex: &Regex, scores: &mut HashMap<String, f64>) {
+    fn score_node(node: &Node, regex: &Regex, scores: &mut HashMap<String, f64>) {
         let hit_count = count_matches(regex, &node.title)
             + count_matches(regex, &node.summary)
             + count_matches(regex, &node.text);
         if hit_count > 0 {
             scores.insert(node.node_id.clone(), hit_count as f64);
         }
-        for child in &node.children {
-            walk(child, regex, scores);
-        }
     }
 
     let mut scores = HashMap::new();
-    for root in &doc.structure {
-        walk(root, regex, &mut scores);
+    let mut stack: Vec<&Node> = doc.structure.iter().rev().collect();
+    while let Some(node) = stack.pop() {
+        score_node(node, regex, &mut scores);
+        stack.extend(node.children.iter().rev());
     }
 
     if let Some(max_score) = scores.values().copied().reduce(f64::max) {
@@ -137,31 +115,6 @@ fn regex_score_doc(doc: &Document, regex: &Regex) -> HashMap<String, f64> {
         }
     }
     scores
-}
-
-/// Check if a document's tree has enough depth for tree walk to help.
-fn has_meaningful_depth(doc: &Document) -> bool {
-    fn max_depth(node: &Node, current: u32) -> u32 {
-        if node.children.is_empty() {
-            return current;
-        }
-        node.children
-            .iter()
-            .map(|child| max_depth(child, current + 1))
-            .max()
-            .unwrap_or(current)
-    }
-
-    if doc.structure.is_empty() {
-        return false;
-    }
-    let depth = doc
-        .structure
-        .iter()
-        .map(|root| max_depth(root, 1))
-        .max()
-        .unwrap_or(0);
-    depth >= MIN_TREE_DEPTH
 }
 
 /// Unified search entry point.
@@ -190,53 +143,11 @@ pub fn search_with_options(
     }
 
     let query_mode = classify_query_mode(query, fts_expression, regex);
-    let mode = resolve_mode(config.search_mode, documents);
+    let mode = candidate_search::resolve_search_mode(config.search_mode, documents);
     match mode {
         SearchMode::Flat => search_flat(documents, fts_index, config, &query_mode),
         SearchMode::Tree => search_tree(documents, fts_index, config, &query_mode),
-        SearchMode::Auto => unreachable!("resolve_mode should never return Auto"),
-    }
-}
-
-/// Resolve Auto mode to concrete Flat or Tree.
-///
-/// Strategy (ported from Python `_resolve_auto_mode`):
-/// 1. Count docs whose source_type benefits from tree walk (markdown, json, yaml, toml, html).
-/// 2. For those, verify they actually have meaningful depth (≥ MIN_TREE_DEPTH).
-///    A markdown file with no headings is effectively flat.
-/// 3. If the ratio of truly-hierarchical docs ≥ TREE_RATIO_THRESHOLD (30%) → tree mode.
-///    Otherwise → flat mode.
-///
-/// This avoids "1 markdown among 50 code files → tree for everything" while
-/// still activating tree mode when it helps.
-fn resolve_mode(mode: SearchMode, documents: &[Document]) -> SearchMode {
-    match mode {
-        SearchMode::Flat => SearchMode::Flat,
-        SearchMode::Tree => SearchMode::Tree,
-        SearchMode::Auto => {
-            if documents.is_empty() {
-                return SearchMode::Flat;
-            }
-            let total = documents.len();
-            let tree_count = documents
-                .iter()
-                .filter(|doc| benefits_from_tree(&doc.source_type) && has_meaningful_depth(doc))
-                .count();
-            let ratio = tree_count as f64 / total as f64;
-            if ratio >= TREE_RATIO_THRESHOLD {
-                tracing::debug!(
-                    "Auto mode → tree: {}/{} docs ({:.0}%) have meaningful hierarchy",
-                    tree_count, total, ratio * 100.0,
-                );
-                SearchMode::Tree
-            } else {
-                tracing::debug!(
-                    "Auto mode → flat: {}/{} docs ({:.0}%) have hierarchy (threshold {:.0}%)",
-                    tree_count, total, ratio * 100.0, TREE_RATIO_THRESHOLD * 100.0,
-                );
-                SearchMode::Flat
-            }
-        }
+        SearchMode::Auto => unreachable!("resolve_search_mode should never return Auto"),
     }
 }
 
@@ -247,140 +158,33 @@ fn search_flat(
     config: &TreeSearchConfig,
     query_mode: &QueryMode,
 ) -> Result<Vec<SearchResult>> {
-    let top_k = config.max_nodes_per_doc * config.top_k_docs;
-
-    let doc_map: HashMap<&str, &Document> = documents
-        .iter()
-        .map(|d| (d.doc_id.as_str(), d))
-        .collect();
-
-    if let Some(pattern) = &query_mode.regex_pattern {
+    let scores = if let Some(pattern) = &query_mode.regex_pattern {
         let regex = compile_contains_regex(pattern)?;
-        let mut results = Vec::new();
-        for doc in documents {
-            let scores = regex_score_doc(doc, &regex);
-            for (node_id, score) in scores {
-                if let Some(node) = doc.find_node(&node_id) {
-                    let breadcrumb = doc.path_to_node(&node_id);
-                    let breadcrumb_titles: Vec<String> = breadcrumb
-                        .iter()
-                        .filter_map(|nid| doc.find_node(nid).map(|n| n.title.clone()))
-                        .collect();
-                    results.push(SearchResult {
-                        node_id,
-                        doc_id: doc.doc_id.clone(),
-                        doc_name: doc.doc_name.clone(),
-                        title: node.title.clone(),
-                        summary: node.summary.clone(),
-                        text: node.text.clone(),
-                        source_type: doc.source_type.to_string(),
-                        source_path: doc.source_path.clone(),
-                        line_start: node.line_start,
-                        line_end: node.line_end,
-                        score,
-                        depth: 0,
-                        breadcrumb: breadcrumb_titles,
-                    });
-                }
-            }
-        }
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(top_k);
-        return Ok(results);
-    }
-
-    if let Some(fts_expression) = query_mode.fts_expression.as_deref() {
+        documents
+            .iter()
+            .filter_map(|document| {
+                let scores = regex_score_doc(document, &regex);
+                (!scores.is_empty()).then_some((document.doc_id.clone(), scores))
+            })
+            .collect()
+    } else {
         let doc_ids: Vec<String> = documents.iter().map(|d| d.doc_id.clone()).collect();
-        let batch = fts_index.score_nodes_batch_with_expr(
+        fts_index.score_nodes_batch_with_expr(
             &query_mode.effective_query,
             Some(&doc_ids),
             0.0,
-            Some(fts_expression),
-        )?;
-        let mut results = Vec::new();
-        for doc in documents {
-            let Some(scores) = batch.get(&doc.doc_id) else {
-                continue;
-            };
-            let mut ranked_nodes: Vec<(&String, &f64)> = scores.iter().collect();
-            ranked_nodes.sort_by(|a, b| {
-                b.1.partial_cmp(a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for (node_id, score) in ranked_nodes {
-                let Some(node) = doc.find_node(node_id) else {
-                    continue;
-                };
-                let breadcrumb = doc.path_to_node(node_id);
-                let breadcrumb_titles: Vec<String> = breadcrumb
-                    .iter()
-                    .filter_map(|nid| doc.find_node(nid).map(|n| n.title.clone()))
-                    .collect();
-                results.push(SearchResult {
-                    node_id: node_id.clone(),
-                    doc_id: doc.doc_id.clone(),
-                    doc_name: doc.doc_name.clone(),
-                    title: node.title.clone(),
-                    summary: node.summary.clone(),
-                    text: node.text.clone(),
-                    source_type: doc.source_type.to_string(),
-                    source_path: doc.source_path.clone(),
-                    line_start: node.line_start,
-                    line_end: node.line_end,
-                    score: *score,
-                    depth: 0,
-                    breadcrumb: breadcrumb_titles,
-                });
-            }
-        }
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(top_k);
-        return Ok(results);
-    }
-
-    let fts_results = fts_index.search_with_expr(
+            query_mode.fts_expression.as_deref(),
+        )?
+    };
+    let mut flat_config = config.clone();
+    flat_config.search_mode = SearchMode::Flat;
+    Ok(candidate_search::search_with_scores(
         &query_mode.effective_query,
-        None,
-        top_k,
-        None,
-    )?;
-
-    let mut results: Vec<SearchResult> = fts_results
-        .into_iter()
-        .filter_map(|fts| {
-            let doc = doc_map.get(fts.doc_id.as_str())?;
-            let node = doc.find_node(&fts.node_id);
-            let (text, line_start, line_end) = match node {
-                Some(n) => (n.text.clone(), n.line_start, n.line_end),
-                None => (String::new(), None, None),
-            };
-            let breadcrumb = doc.path_to_node(&fts.node_id);
-            let breadcrumb_titles: Vec<String> = breadcrumb
-                .iter()
-                .filter_map(|nid| doc.find_node(nid).map(|n| n.title.clone()))
-                .collect();
-
-            Some(SearchResult {
-                node_id: fts.node_id,
-                doc_id: fts.doc_id,
-                doc_name: doc.doc_name.clone(),
-                title: fts.title,
-                summary: fts.summary,
-                text,
-                source_type: doc.source_type.to_string(),
-                source_path: doc.source_path.clone(),
-                line_start,
-                line_end,
-                score: fts.fts_score,
-                depth: fts.depth,
-                breadcrumb: breadcrumb_titles,
-            })
-        })
-        .collect();
-
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(top_k);
-    Ok(results)
+        documents,
+        &scores,
+        &flat_config,
+    )
+    .results)
 }
 
 /// Tree search: anchor retrieval + tree walk + path scoring + flat reranking.
@@ -390,8 +194,6 @@ fn search_tree(
     config: &TreeSearchConfig,
     query_mode: &QueryMode,
 ) -> Result<Vec<SearchResult>> {
-    let searcher = TreeSearcher::new(config);
-
     // Get FTS5 scores for all documents (single batch query)
     let doc_ids: Vec<String> = documents.iter().map(|d| d.doc_id.clone()).collect();
     let fts_score_map = if let Some(pattern) = &query_mode.regex_pattern {
@@ -416,99 +218,18 @@ fn search_tree(
         )?
     };
 
-    // Run tree search
-    let (paths, flat_nodes) = searcher.search(&query_mode.effective_query, documents, &fts_score_map);
-
-    // Convert flat_nodes to SearchResults
-    let doc_map: HashMap<&str, &Document> = documents
-        .iter()
-        .map(|d| (d.doc_id.as_str(), d))
-        .collect();
-
-    let top_k = config.max_nodes_per_doc * config.top_k_docs;
-    let mut results: Vec<SearchResult> = flat_nodes
-        .into_iter()
-        .take(top_k)
-        .filter_map(|flat| {
-            let doc = doc_map.get(flat.doc_id.as_str())?;
-            let node = doc.find_node(&flat.node_id);
-            let (text, summary, line_start, line_end) = match node {
-                Some(n) => (
-                    n.text.clone(),
-                    n.summary.clone(),
-                    n.line_start,
-                    n.line_end,
-                ),
-                None => (flat.text, String::new(), None, None),
-            };
-            let breadcrumb = doc.path_to_node(&flat.node_id);
-            let breadcrumb_titles: Vec<String> = breadcrumb
-                .iter()
-                .filter_map(|nid| doc.find_node(nid).map(|n| n.title.clone()))
-                .collect();
-
-            Some(SearchResult {
-                node_id: flat.node_id,
-                doc_id: flat.doc_id.clone(),
-                doc_name: flat.doc_name,
-                title: flat.title,
-                summary,
-                text,
-                source_type: doc.source_type.to_string(),
-                source_path: doc.source_path.clone(),
-                line_start,
-                line_end,
-                score: flat.score,
-                depth: 0,
-                breadcrumb: breadcrumb_titles,
-            })
-        })
-        .collect();
-
-    // Also inject path results if they scored higher
-    for path in &paths {
-        let doc = match doc_map.get(path.doc_id.as_str()) {
-            Some(d) => d,
-            None => continue,
-        };
-        let node = doc.find_node(&path.target_node_id);
-        let already_present = results.iter().any(|r| {
-            r.doc_id == path.doc_id && r.node_id == path.target_node_id
-        });
-        if !already_present {
-            if let Some(n) = node {
-                let breadcrumb_titles: Vec<String> = path
-                    .path
-                    .iter()
-                    .map(|p| p.title.clone())
-                    .collect();
-                results.push(SearchResult {
-                    node_id: path.target_node_id.clone(),
-                    doc_id: path.doc_id.clone(),
-                    doc_name: path.doc_name.clone(),
-                    title: n.title.clone(),
-                    summary: n.summary.clone(),
-                    text: n.text.clone(),
-                    source_type: doc.source_type.to_string(),
-                    source_path: doc.source_path.clone(),
-                    line_start: n.line_start,
-                    line_end: n.line_end,
-                    score: path.score,
-                    depth: 0,
-                    breadcrumb: breadcrumb_titles,
-                });
-            }
-        }
-    }
-
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    results.truncate(top_k);
-    Ok(results)
+    Ok(candidate_search::search_with_scores(
+        &query_mode.effective_query,
+        documents,
+        &fts_score_map,
+        config,
+    )
+    .results)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{search, search_with_options};
+    use super::{classify_query_mode, search, search_with_options};
     use crate::config::{SearchMode, TreeSearchConfig};
     use crate::document::{Document, Node, SourceType};
     use crate::engine::fts::FTS5Index;
@@ -536,11 +257,12 @@ mod tests {
     }
 
     fn default_config() -> TreeSearchConfig {
-        let mut config = TreeSearchConfig::default();
-        config.search_mode = SearchMode::Flat;
-        config.top_k_docs = 3;
-        config.max_nodes_per_doc = 5;
-        config
+        TreeSearchConfig {
+            search_mode: SearchMode::Flat,
+            top_k_docs: 3,
+            max_nodes_per_doc: 5,
+            ..TreeSearchConfig::default()
+        }
     }
 
     #[test]
@@ -623,15 +345,8 @@ mod tests {
             index.index_document(doc, false).unwrap();
         }
 
-        let results = search_with_options(
-            "o?auth",
-            &docs,
-            &index,
-            &default_config(),
-            None,
-            true,
-        )
-        .unwrap();
+        let results =
+            search_with_options("o?auth", &docs, &index, &default_config(), None, true).unwrap();
         let doc_names: Vec<&str> = results.iter().map(|r| r.doc_name.as_str()).collect();
 
         assert!(doc_names.contains(&"Exact Auth"));
@@ -647,15 +362,8 @@ mod tests {
             index.index_document(doc, false).unwrap();
         }
 
-        let error = search_with_options(
-            "(",
-            &docs,
-            &index,
-            &default_config(),
-            None,
-            true,
-        )
-        .unwrap_err();
+        let error =
+            search_with_options("(", &docs, &index, &default_config(), None, true).unwrap_err();
 
         assert!(error.to_string().contains("regex parse error"));
     }
@@ -671,5 +379,13 @@ mod tests {
         let results = search("au*th", &docs, &index, &default_config()).unwrap();
         let doc_names: Vec<&str> = results.iter().map(|r| r.doc_name.as_str()).collect();
         assert_eq!(doc_names, vec!["Exact Auth"]);
+    }
+
+    #[test]
+    fn test_cjk_punctuation_query_classification_is_utf8_safe() {
+        let mode = classify_query_mode("如何自行报价？", None, false);
+        assert_eq!(mode.effective_query, "如何自行报价？");
+        assert!(mode.fts_expression.is_none());
+        assert!(mode.regex_pattern.is_none());
     }
 }

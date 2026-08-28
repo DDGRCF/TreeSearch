@@ -13,14 +13,20 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use md5::{Digest, Md5};
 use regex::Regex;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-use crate::config::TreeSearchConfig;
+use crate::config::{CjkTokenizerMode, TreeSearchConfig};
 use crate::document::{Document, Node, NodeId, SourceType};
+
+/// Safety bound for one SQLite-to-memory candidate transfer.
+const DEFAULT_BATCH_CANDIDATE_LIMIT: usize = 5_000;
+
+/// Metadata keyed by `(node_id, doc_id)` for batched result assembly.
+type NodeMetadataMap = HashMap<(String, String), (String, String, u32)>;
 
 // ---------------------------------------------------------------------------
 // FTS5 column weights
@@ -66,6 +72,27 @@ impl FtsWeights {
             "{}, {}, {}, {}, {}",
             self.title, self.summary, self.body, self.code_blocks, self.front_matter
         )
+    }
+
+    /// Rejects values that cannot safely participate in SQLite BM25 ranking.
+    fn validate(&self) -> Result<()> {
+        let weights = [
+            self.title,
+            self.summary,
+            self.body,
+            self.code_blocks,
+            self.front_matter,
+        ];
+        if weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+        {
+            bail!("FTS5 weights must be finite and non-negative");
+        }
+        if weights.iter().all(|weight| *weight == 0.0) {
+            bail!("at least one FTS5 weight must be positive");
+        }
+        Ok(())
     }
 }
 
@@ -178,11 +205,11 @@ pub fn parse_md_node_text(text: &str) -> MdFields {
 /// Tokenize text for FTS5 indexing. Returns space-separated tokens.
 ///
 /// Delegates to `crate::tokenizer::tokenize_for_fts` for CJK support.
-fn tokenize_for_fts(text: &str) -> String {
+fn tokenize_for_fts(text: &str, cjk_mode: CjkTokenizerMode) -> String {
     if text.trim().is_empty() {
         return String::new();
     }
-    crate::tokenizer::tokenize_for_fts(text, crate::config::CjkTokenizerMode::Auto)
+    crate::tokenizer::tokenize_for_fts(text, cjk_mode)
 }
 
 /// FTS5 operators that must NOT be tokenized.
@@ -193,14 +220,14 @@ fn is_fts5_operator(word: &str) -> bool {
 }
 
 /// Tokenize terms in an FTS5 expression while preserving operators.
-fn tokenize_fts_expression(expr: &str) -> String {
+fn tokenize_fts_expression(expr: &str, cjk_mode: CjkTokenizerMode) -> String {
     let parts: Vec<&str> = expr.split_whitespace().collect();
     let mut result = Vec::new();
     for part in parts {
         if FTS5_OPERATORS.contains(&part.to_uppercase().as_str()) {
             result.push(part.to_uppercase());
         } else {
-            let tokenized = tokenize_for_fts(part);
+            let tokenized = tokenize_for_fts(part, cjk_mode);
             let trimmed = tokenized.trim().to_string();
             if !trimmed.is_empty() {
                 result.push(trimmed);
@@ -219,9 +246,9 @@ fn md5_hex(data: &[u8]) -> String {
     format!("{:x}", hash)
 }
 
-fn content_hash_for_doc(doc: &Document) -> String {
-    let json = serde_json::to_string(&doc.structure).unwrap_or_default();
-    md5_hex(json.as_bytes())
+fn content_hash_for_doc(doc: &Document) -> Result<String> {
+    let json = serde_json::to_string(&doc.structure)?;
+    Ok(md5_hex(json.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +268,8 @@ pub struct FTS5Index {
     conn: Connection,
     db_path: String,
     weights: FtsWeights,
+    cjk_tokenizer: CjkTokenizerMode,
+    max_node_chars: usize,
 }
 
 impl FTS5Index {
@@ -253,24 +282,69 @@ impl FTS5Index {
     /// - `db_path = None` → in-memory (`:memory:`).
     /// - `weights = None` → default column weights.
     pub fn new(db_path: Option<&str>, weights: Option<FtsWeights>) -> Result<Self> {
-        let path = db_path.unwrap_or(":memory:");
+        Self::new_path(db_path.map(std::path::Path::new), weights)
+    }
 
-        if path != ":memory:" {
-            if let Some(parent) = std::path::Path::new(path).parent() {
+    /// Creates an index from an OS-native path without requiring UTF-8.
+    pub fn new_path(
+        db_path: Option<&std::path::Path>,
+        weights: Option<FtsWeights>,
+    ) -> Result<Self> {
+        Self::open(
+            db_path,
+            weights.unwrap_or_default(),
+            CjkTokenizerMode::Auto,
+            TreeSearchConfig::default().max_node_chars,
+        )
+    }
+
+    /// Creates an index using both FTS weights and tokenizer settings from config.
+    pub fn with_config(db_path: Option<&str>, config: &TreeSearchConfig) -> Result<Self> {
+        Self::with_config_path(db_path.map(std::path::Path::new), config)
+    }
+
+    /// Creates a configured index from an OS-native path without requiring UTF-8.
+    pub fn with_config_path(
+        db_path: Option<&std::path::Path>,
+        config: &TreeSearchConfig,
+    ) -> Result<Self> {
+        crate::tokenizer::cjk::configure_from(config);
+        Self::open(
+            db_path,
+            FtsWeights::from_config(config),
+            config.cjk_tokenizer,
+            config.max_node_chars,
+        )
+    }
+
+    /// Opens SQLite after validating all ranking inputs.
+    fn open(
+        db_path: Option<&std::path::Path>,
+        weights: FtsWeights,
+        cjk_tokenizer: CjkTokenizerMode,
+        max_node_chars: usize,
+    ) -> Result<Self> {
+        weights.validate()?;
+        let path = db_path.unwrap_or_else(|| std::path::Path::new(":memory:"));
+
+        if path != std::path::Path::new(":memory:") {
+            if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent)
-                        .with_context(|| format!("create dir for {}", path))?;
+                        .with_context(|| format!("create dir for {}", path.display()))?;
                 }
             }
         }
 
         let conn =
-            Connection::open(path).with_context(|| format!("open SQLite at {}", path))?;
+            Connection::open(path).with_context(|| format!("open SQLite at {}", path.display()))?;
 
         let mut index = Self {
             conn,
-            db_path: path.to_string(),
-            weights: weights.unwrap_or_default(),
+            db_path: path.to_string_lossy().into_owned(),
+            weights,
+            cjk_tokenizer,
+            max_node_chars,
         };
         index.init_db()?;
         Ok(index)
@@ -354,7 +428,9 @@ impl FTS5Index {
     /// Returns the number of nodes indexed (0 if content hash matches
     /// and `force` is false).
     pub fn index_document(&self, doc: &Document, force: bool) -> Result<usize> {
-        let content_hash = content_hash_for_doc(doc);
+        doc.validate_structure()
+            .with_context(|| format!("validate document `{}`", doc.doc_id))?;
+        let content_hash = content_hash_for_doc(doc)?;
 
         // Incremental check
         if !force {
@@ -371,10 +447,11 @@ impl FTS5Index {
             }
         }
 
-        // Clear old entries
-        self.delete_fts_rows_for_doc(&doc.doc_id)?;
-        self.conn
-            .execute("DELETE FROM nodes WHERE doc_id = ?1", params![doc.doc_id])?;
+        let transaction = self.conn.unchecked_transaction()?;
+
+        // Clear old entries inside the same transaction as replacement rows.
+        delete_fts_rows_for_doc(&transaction, &doc.doc_id)?;
+        transaction.execute("DELETE FROM nodes WHERE doc_id = ?1", params![doc.doc_id])?;
 
         let parent_map = doc.build_parent_map();
         let depth_map = doc.build_depth_map();
@@ -392,7 +469,7 @@ impl FTS5Index {
                 .unwrap_or("");
             let node_hash = &md5_hex(node.text.as_bytes())[..16];
 
-            self.conn.execute(
+            transaction.execute(
                 "INSERT OR REPLACE INTO nodes
                  (node_id, doc_id, title, summary, depth, line_start, line_end, parent_node_id, content_hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -409,14 +486,20 @@ impl FTS5Index {
                 ],
             )?;
 
-            let parsed = parse_md_node_text(&node.text);
-            let title_tok = tokenize_for_fts(&node.title);
-            let summary_tok = tokenize_for_fts(&node.summary);
-            let body_tok = tokenize_for_fts(&parsed.body);
-            let code_tok = tokenize_for_fts(&parsed.code_blocks);
-            let fm_tok = tokenize_for_fts(&parsed.front_matter);
+            let parsed = parse_md_node_text(bounded_prefix(&node.text, self.max_node_chars));
+            let title_tok = tokenize_for_fts(
+                bounded_prefix(&node.title, self.max_node_chars),
+                self.cjk_tokenizer,
+            );
+            let summary_tok = tokenize_for_fts(
+                bounded_prefix(&node.summary, self.max_node_chars),
+                self.cjk_tokenizer,
+            );
+            let body_tok = tokenize_for_fts(&parsed.body, self.cjk_tokenizer);
+            let code_tok = tokenize_for_fts(&parsed.code_blocks, self.cjk_tokenizer);
+            let fm_tok = tokenize_for_fts(&parsed.front_matter, self.cjk_tokenizer);
 
-            self.conn.execute(
+            transaction.execute(
                 "INSERT INTO fts_nodes
                  (node_id, doc_id, title, summary, body, code_blocks, front_matter)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -434,8 +517,8 @@ impl FTS5Index {
         }
 
         // Upsert document record
-        let structure_json = serde_json::to_string(&doc.structure).unwrap_or_default();
-        self.conn.execute(
+        let structure_json = serde_json::to_string(&doc.structure)?;
+        transaction.execute(
             "INSERT OR REPLACE INTO documents
              (doc_id, doc_name, doc_description, source_path, source_type,
               structure_json, node_count, index_hash)
@@ -452,6 +535,7 @@ impl FTS5Index {
             ],
         )?;
 
+        transaction.commit()?;
         Ok(count)
     }
 
@@ -472,12 +556,14 @@ impl FTS5Index {
 
     /// Batch store/update file hashes. Single transaction for performance.
     pub fn set_index_meta_batch(&self, meta: &HashMap<String, String>) -> Result<()> {
+        let transaction = self.conn.unchecked_transaction()?;
         for (path, hash) in meta {
-            self.conn.execute(
+            transaction.execute(
                 "INSERT OR REPLACE INTO index_meta (source_path, file_hash) VALUES (?1, ?2)",
                 params![path, hash],
             )?;
         }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -494,27 +580,6 @@ impl FTS5Index {
         }
     }
 
-    /// Delete FTS5 rows for a document (by rowid, since doc_id is UNINDEXED).
-    fn delete_fts_rows_for_doc(&self, doc_id: &str) -> Result<()> {
-        let rowids: Vec<i64> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT rowid FROM fts_nodes WHERE doc_id = ?1")?;
-            let rows = stmt.query_map(params![doc_id], |row| row.get(0))?;
-            rows.filter_map(|r| r.ok()).collect()
-        };
-        if !rowids.is_empty() {
-            let placeholders: String = rowids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-            let sql = format!("DELETE FROM fts_nodes WHERE rowid IN ({})", placeholders);
-            let mut stmt = self.conn.prepare(&sql)?;
-            for (i, rid) in rowids.iter().enumerate() {
-                stmt.raw_bind_parameter(i + 1, *rid)?;
-            }
-            stmt.raw_execute()?;
-        }
-        Ok(())
-    }
-
     // ---------------------------------------------------------------
     // Search
     // ---------------------------------------------------------------
@@ -523,14 +588,14 @@ impl FTS5Index {
     /// Returns `None` if no valid tokens could be extracted.
     fn build_match_expr(&self, query: &str, fts_expression: Option<&str>) -> Option<String> {
         if let Some(expr) = fts_expression {
-            let tokenized = tokenize_fts_expression(expr);
+            let tokenized = tokenize_fts_expression(expr, self.cjk_tokenizer);
             if tokenized.trim().is_empty() {
                 return None;
             }
             return Some(tokenized);
         }
 
-        let tokens = tokenize_for_fts(query);
+        let tokens = tokenize_for_fts(query, self.cjk_tokenizer);
         if tokens.trim().is_empty() {
             return None;
         }
@@ -611,18 +676,15 @@ impl FTS5Index {
                     return Ok(Vec::new());
                 }
             };
-            let rows = stmt.query_map(
-                params![match_expr, did, top_k as i64],
-                |row| {
-                    Ok(RawRow {
-                        node_id: row.get(0)?,
-                        doc_id: row.get(1)?,
-                        title: row.get(2)?,
-                        summary: row.get(3)?,
-                        rank_score: row.get(4)?,
-                    })
-                },
-            )?;
+            let rows = stmt.query_map(params![match_expr, did, top_k as i64], |row| {
+                Ok(RawRow {
+                    node_id: row.get(0)?,
+                    doc_id: row.get(1)?,
+                    title: row.get(2)?,
+                    summary: row.get(3)?,
+                    rank_score: row.get(4)?,
+                })
+            })?;
             rows.filter_map(|r| r.ok()).collect()
         } else {
             let sql = format!(
@@ -640,18 +702,15 @@ impl FTS5Index {
                     return Ok(Vec::new());
                 }
             };
-            let rows = stmt.query_map(
-                params![match_expr, top_k as i64],
-                |row| {
-                    Ok(RawRow {
-                        node_id: row.get(0)?,
-                        doc_id: row.get(1)?,
-                        title: row.get(2)?,
-                        summary: row.get(3)?,
-                        rank_score: row.get(4)?,
-                    })
-                },
-            )?;
+            let rows = stmt.query_map(params![match_expr, top_k as i64], |row| {
+                Ok(RawRow {
+                    node_id: row.get(0)?,
+                    doc_id: row.get(1)?,
+                    title: row.get(2)?,
+                    summary: row.get(3)?,
+                    rank_score: row.get(4)?,
+                })
+            })?;
             rows.filter_map(|r| r.ok()).collect()
         };
 
@@ -664,7 +723,7 @@ impl FTS5Index {
 
         // Deduplicate and assemble results
         let mut results: Vec<FtsResult> = Vec::new();
-        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut seen: HashMap<(String, String), usize> = HashMap::new();
 
         for raw in &raw_rows {
             let mut fts_score = if raw.rank_score != 0.0 {
@@ -672,11 +731,12 @@ impl FTS5Index {
             } else {
                 0.0
             };
-            if phrase_boost_nids.contains(&raw.node_id) {
+            let identity = (raw.doc_id.clone(), raw.node_id.clone());
+            if phrase_boost_nids.contains(&identity) {
                 fts_score *= 1.5;
             }
 
-            if let Some(&idx) = seen.get(&raw.node_id) {
+            if let Some(&idx) = seen.get(&identity) {
                 if fts_score > results[idx].fts_score {
                     results[idx].fts_score = round6(fts_score);
                 }
@@ -684,7 +744,7 @@ impl FTS5Index {
             }
 
             let meta = node_meta.get(&(raw.node_id.clone(), raw.doc_id.clone()));
-            seen.insert(raw.node_id.clone(), results.len());
+            seen.insert(identity, results.len());
             results.push(FtsResult {
                 node_id: raw.node_id.clone(),
                 doc_id: raw.doc_id.clone(),
@@ -695,9 +755,13 @@ impl FTS5Index {
             });
         }
 
-        if !phrase_boost_nids.is_empty() {
-            results.sort_by(|a, b| b.fts_score.partial_cmp(&a.fts_score).unwrap());
-        }
+        results.sort_by(|left, right| {
+            right
+                .fts_score
+                .total_cmp(&left.fts_score)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+                .then_with(|| left.node_id.cmp(&right.node_id))
+        });
 
         Ok(results)
     }
@@ -707,7 +771,7 @@ impl FTS5Index {
         &self,
         query: &str,
         doc_id: Option<&str>,
-    ) -> std::collections::HashSet<String> {
+    ) -> std::collections::HashSet<(String, String)> {
         let mut nids = std::collections::HashSet::new();
         let words: Vec<&str> = query
             .split(|c: char| !c.is_alphanumeric())
@@ -718,15 +782,17 @@ impl FTS5Index {
         }
         let phrase_expr = format!("\"{}\"", words.join(" ").to_lowercase());
 
-        let result: std::result::Result<Vec<String>, _> = if let Some(did) = doc_id {
+        let result: std::result::Result<Vec<(String, String)>, _> = if let Some(did) = doc_id {
             self.conn
                 .prepare(
-                    "SELECT f.node_id FROM fts_nodes f \
+                    "SELECT f.node_id, f.doc_id FROM fts_nodes f \
                      WHERE fts_nodes MATCH ?1 AND f.doc_id = ?2 LIMIT 50",
                 )
                 .and_then(|mut stmt| {
-                    let rows: Vec<String> = stmt
-                        .query_map(params![phrase_expr, did], |row| row.get(0))?
+                    let rows: Vec<(String, String)> = stmt
+                        .query_map(params![phrase_expr, did], |row| {
+                            Ok((row.get(1)?, row.get(0)?))
+                        })?
                         .filter_map(|r| r.ok())
                         .collect();
                     Ok(rows)
@@ -734,12 +800,12 @@ impl FTS5Index {
         } else {
             self.conn
                 .prepare(
-                    "SELECT f.node_id FROM fts_nodes f \
+                    "SELECT f.node_id, f.doc_id FROM fts_nodes f \
                      WHERE fts_nodes MATCH ?1 LIMIT 50",
                 )
                 .and_then(|mut stmt| {
-                    let rows: Vec<String> = stmt
-                        .query_map(params![phrase_expr], |row| row.get(0))?
+                    let rows: Vec<(String, String)> = stmt
+                        .query_map(params![phrase_expr], |row| Ok((row.get(1)?, row.get(0)?)))?
                         .filter_map(|r| r.ok())
                         .collect();
                     Ok(rows)
@@ -753,10 +819,7 @@ impl FTS5Index {
     }
 
     /// Batch lookup node metadata (title, summary, depth) from the `nodes` table.
-    fn batch_lookup_node_meta(
-        &self,
-        keys: &[(String, String)],
-    ) -> Result<HashMap<(String, String), (String, String, u32)>> {
+    fn batch_lookup_node_meta(&self, keys: &[(String, String)]) -> Result<NodeMetadataMap> {
         let mut meta = HashMap::new();
         for (nid, did) in keys {
             let key = (nid.clone(), did.clone());
@@ -788,7 +851,8 @@ impl FTS5Index {
     /// Batch scoring with ancestor propagation.
     ///
     /// Returns `{doc_id: {node_id: score}}` for all matched documents.
-    /// Scores are normalized to `[0, 1]` per document.
+    /// Scores are normalized to `[0, 1]` across the whole candidate set, so
+    /// cross-document relevance is preserved before tree reranking.
     pub fn score_nodes_batch(
         &self,
         query: &str,
@@ -805,49 +869,56 @@ impl FTS5Index {
         ancestor_decay: f64,
         fts_expression: Option<&str>,
     ) -> Result<HashMap<String, HashMap<String, f64>>> {
+        let ancestor_decay = if ancestor_decay.is_finite() {
+            ancestor_decay.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         let match_expr = match self.build_match_expr(query, fts_expression) {
             Some(e) => e,
             None => return Ok(HashMap::new()),
         };
 
         let weight_args = self.weights.bm25_args();
+        let phrase_boost_nodes = self.collect_phrase_boost_nids(query, None);
 
         // Build SQL depending on whether doc_ids filter is given.
-        let (sql, extra_params): (String, Vec<String>) =
-            if let Some(ids) = doc_ids {
-                if ids.is_empty() {
-                    return Ok(HashMap::new());
-                }
-                let placeholders: String = (0..ids.len())
-                    .map(|i| format!("?{}", i + 2))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                (
-                    format!(
-                        "SELECT f.node_id, f.doc_id,
+        let (sql, extra_params): (String, Vec<String>) = if let Some(ids) = doc_ids {
+            if ids.is_empty() {
+                return Ok(HashMap::new());
+            }
+            let placeholders: String = (0..ids.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            (
+                format!(
+                    "SELECT f.node_id, f.doc_id,
                                 bm25(fts_nodes, {w}) AS rank_score
                          FROM fts_nodes f
                          WHERE fts_nodes MATCH ?1
                            AND f.doc_id IN ({p})
-                         ORDER BY rank_score LIMIT 5000",
-                        w = weight_args,
-                        p = placeholders,
-                    ),
-                    ids.to_vec(),
-                )
-            } else {
-                (
-                    format!(
-                        "SELECT f.node_id, f.doc_id,
+                         ORDER BY rank_score LIMIT {limit}",
+                    w = weight_args,
+                    p = placeholders,
+                    limit = DEFAULT_BATCH_CANDIDATE_LIMIT,
+                ),
+                ids.to_vec(),
+            )
+        } else {
+            (
+                format!(
+                    "SELECT f.node_id, f.doc_id,
                                 bm25(fts_nodes, {w}) AS rank_score
                          FROM fts_nodes f
                          WHERE fts_nodes MATCH ?1
-                         ORDER BY rank_score LIMIT 5000",
-                        w = weight_args,
-                    ),
-                    Vec::new(),
-                )
-            };
+                         ORDER BY rank_score LIMIT {limit}",
+                    w = weight_args,
+                    limit = DEFAULT_BATCH_CANDIDATE_LIMIT,
+                ),
+                Vec::new(),
+            )
+        };
 
         let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
@@ -867,11 +938,10 @@ impl FTS5Index {
                 let node_id: String = row.get(0)?;
                 let doc_id: String = row.get(1)?;
                 let rank_score: f64 = row.get(2)?;
-                let fts_score = if rank_score != 0.0 {
-                    -rank_score
-                } else {
-                    0.0
-                };
+                let mut fts_score = if rank_score != 0.0 { -rank_score } else { 0.0 };
+                if phrase_boost_nodes.contains(&(doc_id.clone(), node_id.clone())) {
+                    fts_score *= 1.5;
+                }
                 let entry = per_doc_raw.entry(doc_id).or_default();
                 let old = entry.get(&node_id).copied().unwrap_or(0.0);
                 entry.insert(node_id, old.max(fts_score));
@@ -890,50 +960,43 @@ impl FTS5Index {
             HashMap::new()
         };
 
-        // Normalize + ancestor propagation per doc.
+        // Normalize globally before ancestor propagation so weaker documents do
+        // not each receive an artificial score of 1.0.
+        let global_max = per_doc_raw
+            .values()
+            .flat_map(HashMap::values)
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .max(1e-10);
         let mut result: HashMap<String, HashMap<String, f64>> = HashMap::new();
 
         for (doc_id, raw_scores) in &per_doc_raw {
-            let max_s = raw_scores
-                .values()
-                .copied()
-                .fold(0.0f64, f64::max)
-                .max(1e-10);
             let mut scores: HashMap<String, f64> = raw_scores
                 .iter()
-                .map(|(nid, &s)| (nid.clone(), s / max_s))
+                .map(|(nid, &score)| (nid.clone(), score / global_max))
                 .collect();
 
             if ancestor_decay > 0.0 {
                 if let Some(children_map) = doc_children_map.get(doc_id) {
-                    for (pid, cids) in children_map {
-                        let max_child = cids
-                            .iter()
-                            .filter_map(|c| scores.get(c))
-                            .copied()
-                            .fold(0.0f64, f64::max);
-                        if max_child > 0.0 {
-                            *scores.entry(pid.clone()).or_insert(0.0) += ancestor_decay * max_child;
-                        }
-                    }
-                    let final_max = scores
-                        .values()
-                        .copied()
-                        .fold(0.0f64, f64::max)
-                        .max(1e-10);
-                    if final_max > 1.0 {
-                        for s in scores.values_mut() {
-                            *s /= final_max;
-                        }
-                    }
+                    scores = propagate_ancestor_scores(&scores, children_map, ancestor_decay);
                 }
             }
+            result.insert(doc_id.clone(), scores);
+        }
 
-            let rounded: HashMap<String, f64> = scores
-                .into_iter()
-                .map(|(nid, s)| (nid, round6(s)))
-                .collect();
-            result.insert(doc_id.clone(), rounded);
+        let propagated_max = result
+            .values()
+            .flat_map(HashMap::values)
+            .copied()
+            .fold(0.0_f64, f64::max)
+            .max(1e-10);
+        for scores in result.values_mut() {
+            for score in scores.values_mut() {
+                if propagated_max > 1.0 {
+                    *score /= propagated_max;
+                }
+                *score = round6(*score);
+            }
         }
 
         Ok(result)
@@ -983,7 +1046,9 @@ impl FTS5Index {
 
     /// Save a Document's tree structure (without FTS indexing).
     pub fn save_document(&self, doc: &Document) -> Result<()> {
-        let structure_json = serde_json::to_string(&doc.structure).unwrap_or_default();
+        doc.validate_structure()
+            .with_context(|| format!("validate document `{}`", doc.doc_id))?;
+        let structure_json = serde_json::to_string(&doc.structure)?;
         let content_hash = md5_hex(structure_json.as_bytes());
         let node_count = doc.flatten_nodes().len();
 
@@ -1029,13 +1094,16 @@ impl FTS5Index {
                 let structure: Vec<Node> = if sjson.is_empty() {
                     Vec::new()
                 } else {
-                    serde_json::from_str(&sjson).unwrap_or_default()
+                    serde_json::from_str(&sjson)
+                        .with_context(|| format!("decode stored structure for document `{did}`"))?
                 };
                 let source_type = source_type_from_str(&stype);
                 let mut doc = Document::new(did, dname, source_type);
                 doc.doc_description = ddesc;
                 doc.source_path = spath;
                 doc.structure = structure;
+                doc.validate_structure()
+                    .with_context(|| format!("validate stored document `{}`", doc.doc_id))?;
                 Ok(Some(doc))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1066,13 +1134,16 @@ impl FTS5Index {
             let structure: Vec<Node> = if sjson.is_empty() {
                 Vec::new()
             } else {
-                serde_json::from_str(&sjson).unwrap_or_default()
+                serde_json::from_str(&sjson)
+                    .with_context(|| format!("decode stored structure for document `{did}`"))?
             };
             let source_type = source_type_from_str(&stype);
             let mut doc = Document::new(did, dname, source_type);
             doc.doc_description = ddesc;
             doc.source_path = spath;
             doc.structure = structure;
+            doc.validate_structure()
+                .with_context(|| format!("validate stored document `{}`", doc.doc_id))?;
             documents.push(doc);
         }
         Ok(documents)
@@ -1096,17 +1167,17 @@ impl FTS5Index {
         }
         let source_path = source_path.unwrap();
 
-        self.delete_fts_rows_for_doc(doc_id)?;
-        self.conn
-            .execute("DELETE FROM nodes WHERE doc_id = ?1", params![doc_id])?;
-        self.conn
-            .execute("DELETE FROM documents WHERE doc_id = ?1", params![doc_id])?;
+        let transaction = self.conn.unchecked_transaction()?;
+        delete_fts_rows_for_doc(&transaction, doc_id)?;
+        transaction.execute("DELETE FROM nodes WHERE doc_id = ?1", params![doc_id])?;
+        transaction.execute("DELETE FROM documents WHERE doc_id = ?1", params![doc_id])?;
         if !source_path.is_empty() {
-            self.conn.execute(
+            transaction.execute(
                 "DELETE FROM index_meta WHERE source_path = ?1",
                 params![source_path],
             )?;
         }
+        transaction.commit()?;
 
         Ok(true)
     }
@@ -1159,9 +1230,9 @@ impl FTS5Index {
 
     /// Get index statistics.
     pub fn get_stats(&self) -> Result<IndexStats> {
-        let doc_count: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
+        let doc_count: usize =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
         let node_count: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM nodes", [], |row| row.get(0))?;
@@ -1188,10 +1259,12 @@ impl FTS5Index {
 
     /// Clear all indexed data.
     pub fn clear(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM fts_nodes", [])?;
-        self.conn.execute("DELETE FROM nodes", [])?;
-        self.conn.execute("DELETE FROM documents", [])?;
-        self.conn.execute("DELETE FROM index_meta", [])?;
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute("DELETE FROM fts_nodes", [])?;
+        transaction.execute("DELETE FROM nodes", [])?;
+        transaction.execute("DELETE FROM documents", [])?;
+        transaction.execute("DELETE FROM index_meta", [])?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1210,8 +1283,96 @@ impl FTS5Index {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Deletes every FTS row for one document using the caller's transaction.
+fn delete_fts_rows_for_doc(connection: &Connection, doc_id: &str) -> Result<()> {
+    let rowids: Vec<i64> = {
+        let mut statement = connection.prepare("SELECT rowid FROM fts_nodes WHERE doc_id = ?1")?;
+        let rows = statement
+            .query_map(params![doc_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    if rowids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = rowids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!("DELETE FROM fts_nodes WHERE rowid IN ({placeholders})");
+    let mut statement = connection.prepare(&sql)?;
+    for (index, row_id) in rowids.iter().enumerate() {
+        statement.raw_bind_parameter(index + 1, *row_id)?;
+    }
+    statement.raw_execute()?;
+    Ok(())
+}
+
+/// Returns an indexing prefix without splitting UTF-8 code points.
+fn bounded_prefix(text: &str, max_characters: usize) -> &str {
+    match text.char_indices().nth(max_characters) {
+        Some((end, _)) => &text[..end],
+        None => text,
+    }
+}
+
 fn round6(v: f64) -> f64 {
     (v * 1e6).round() / 1e6
+}
+
+/// Propagates child relevance to every ancestor in deterministic bottom-up order.
+fn propagate_ancestor_scores(
+    base_scores: &HashMap<String, f64>,
+    children_map: &HashMap<String, Vec<String>>,
+    ancestor_decay: f64,
+) -> HashMap<String, f64> {
+    let mut node_ids: Vec<String> = base_scores
+        .keys()
+        .chain(children_map.keys())
+        .chain(children_map.values().flatten())
+        .cloned()
+        .collect();
+    node_ids.sort();
+    node_ids.dedup();
+
+    let mut memo = HashMap::new();
+    let mut visit_state = HashMap::<String, u8>::new();
+    for root_id in node_ids {
+        if memo.contains_key(&root_id) {
+            continue;
+        }
+        let mut stack = vec![(root_id, false)];
+        while let Some((node_id, exiting)) = stack.pop() {
+            if exiting {
+                let max_child = children_map
+                    .get(&node_id)
+                    .into_iter()
+                    .flatten()
+                    .map(|child| {
+                        memo.get(child)
+                            .copied()
+                            .unwrap_or_else(|| base_scores.get(child).copied().unwrap_or(0.0))
+                    })
+                    .fold(0.0_f64, f64::max);
+                let base = base_scores.get(&node_id).copied().unwrap_or(0.0);
+                memo.insert(node_id.clone(), base + ancestor_decay * max_child);
+                visit_state.insert(node_id, 2);
+                continue;
+            }
+            if visit_state.get(&node_id) == Some(&2) {
+                continue;
+            }
+            visit_state.insert(node_id.clone(), 1);
+            stack.push((node_id.clone(), true));
+            let mut children = children_map.get(&node_id).cloned().unwrap_or_default();
+            children.sort();
+            children.dedup();
+            for child in children.into_iter().rev() {
+                if !visit_state.contains_key(&child) {
+                    stack.push((child, false));
+                }
+            }
+        }
+    }
+    memo.retain(|_, score| score.is_finite() && *score > 0.0);
+    memo
 }
 
 fn source_type_from_str(s: &str) -> SourceType {
@@ -1251,8 +1412,7 @@ mod tests {
         child1.summary = "DL overview".to_string();
 
         let mut child2 = Node::new("2", "Reinforcement Learning");
-        child2.text =
-            "Reinforcement learning trains agents through reward signals.".to_string();
+        child2.text = "Reinforcement learning trains agents through reward signals.".to_string();
         child2.summary = "RL overview".to_string();
 
         let mut grandchild = Node::new("3", "Transformers");
@@ -1265,6 +1425,61 @@ mod tests {
         root.children.push(child2);
         doc.structure.push(root);
         doc
+    }
+
+    #[test]
+    fn test_ancestor_propagation_is_stable_across_insertion_orders() {
+        let base_scores = HashMap::from([("leaf".to_string(), 1.0)]);
+        let mut parent_first = HashMap::new();
+        parent_first.insert("root".to_string(), vec!["section".to_string()]);
+        parent_first.insert("section".to_string(), vec!["leaf".to_string()]);
+        let mut child_first = HashMap::new();
+        child_first.insert("section".to_string(), vec!["leaf".to_string()]);
+        child_first.insert("root".to_string(), vec!["section".to_string()]);
+
+        let first = propagate_ancestor_scores(&base_scores, &parent_first, 0.6);
+        let second = propagate_ancestor_scores(&base_scores, &child_first, 0.6);
+
+        assert_eq!(first, second);
+        assert_eq!(first.get("leaf"), Some(&1.0));
+        assert_eq!(first.get("section"), Some(&0.6));
+        assert_eq!(first.get("root"), Some(&0.36));
+    }
+
+    #[test]
+    fn test_batch_scoring_reaches_all_ancestors_deterministically() {
+        let index = FTS5Index::new(None, None).unwrap();
+        let doc = sample_doc();
+        index.index_document(&doc, false).unwrap();
+
+        for _ in 0..10 {
+            let scores = index.score_nodes_batch("transformers", None, 0.6).unwrap();
+            let doc_scores = scores.get("doc1").expect("document scores");
+            assert_eq!(doc_scores.get("3"), Some(&1.0));
+            assert_eq!(doc_scores.get("1"), Some(&0.6));
+            assert_eq!(doc_scores.get("0"), Some(&0.36));
+        }
+    }
+
+    #[test]
+    fn test_ancestor_propagation_is_bounded_for_cycles_and_deep_trees() {
+        let cycle = HashMap::from([
+            ("a".to_string(), vec!["b".to_string()]),
+            ("b".to_string(), vec!["a".to_string()]),
+        ]);
+        let cycle_scores =
+            propagate_ancestor_scores(&HashMap::from([("a".to_string(), 1.0)]), &cycle, 0.6);
+        assert!(cycle_scores.values().all(|score| score.is_finite()));
+        assert!(cycle_scores.values().all(|score| *score <= 1.6));
+
+        let mut deep = HashMap::new();
+        for index in 0..4095 {
+            deep.insert(index.to_string(), vec![(index + 1).to_string()]);
+        }
+        let scores =
+            propagate_ancestor_scores(&HashMap::from([("4095".to_string(), 1.0)]), &deep, 0.6);
+        assert_eq!(scores.get("4095"), Some(&1.0));
+        assert!(scores.get("0").is_some_and(|score| score.is_finite()));
     }
 
     #[test]
@@ -1288,6 +1503,56 @@ mod tests {
     }
 
     #[test]
+    fn search_keeps_same_node_id_from_different_documents_distinct() {
+        let index = FTS5Index::new(None, None).unwrap();
+        let mut first = Document::new("a", "A", SourceType::Text);
+        let mut first_node = Node::new("0", "Exact phrase");
+        first_node.text = "alpha beta appears together".into();
+        first.structure.push(first_node);
+        let mut second = Document::new("b", "B", SourceType::Text);
+        let mut second_node = Node::new("0", "Separated terms");
+        second_node.text = "alpha filler filler beta".into();
+        second.structure.push(second_node);
+        index.index_document(&first, false).unwrap();
+        index.index_document(&second, false).unwrap();
+
+        let results = index.search("alpha beta", None, 10).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| (result.doc_id.as_str(), result.node_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "0"), ("b", "0")]
+        );
+        let phrase_boost = index.collect_phrase_boost_nids("alpha beta", None);
+        assert!(phrase_boost.contains(&("a".to_string(), "0".to_string())));
+        assert!(!phrase_boost.contains(&("b".to_string(), "0".to_string())));
+    }
+
+    #[test]
+    fn batch_scores_preserve_cross_document_calibration() {
+        let index = FTS5Index::new(None, None).unwrap();
+        let mut strong = Document::new("strong", "Strong", SourceType::Text);
+        let mut strong_node = Node::new("0", "target target target");
+        strong_node.text = "target target target target".into();
+        strong.structure.push(strong_node);
+        let mut weak = Document::new("weak", "Weak", SourceType::Text);
+        let mut weak_node = Node::new("0", "Other");
+        weak_node.text = "target with a much longer unrelated body of filler words".into();
+        weak.structure.push(weak_node);
+        index.index_document(&strong, false).unwrap();
+        index.index_document(&weak, false).unwrap();
+
+        let scores = index.score_nodes_batch("target", None, 0.0).unwrap();
+        let strong_score = scores["strong"]["0"];
+        let weak_score = scores["weak"]["0"];
+        assert_eq!(strong_score.max(weak_score), 1.0);
+        assert_ne!(strong_score, weak_score);
+        assert!(strong_score > weak_score);
+    }
+
+    #[test]
     fn test_incremental_indexing() {
         let index = FTS5Index::new(None, None).unwrap();
         let doc = sample_doc();
@@ -1302,6 +1567,44 @@ mod tests {
         // Force re-index
         let count3 = index.index_document(&doc, true).unwrap();
         assert_eq!(count3, 4);
+    }
+
+    #[test]
+    fn invalid_weights_and_documents_fail_before_replacing_valid_data() {
+        let invalid_weights = FtsWeights {
+            body: f64::NAN,
+            ..FtsWeights::default()
+        };
+        assert!(FTS5Index::new(None, Some(invalid_weights)).is_err());
+
+        let index = FTS5Index::new(None, None).unwrap();
+        let valid = sample_doc();
+        index.index_document(&valid, false).unwrap();
+        let mut invalid = valid.clone();
+        invalid.structure[0].children[1].node_id = "1".into();
+        assert!(index.index_document(&invalid, true).is_err());
+
+        let results = index.search("transformers", Some("doc1"), 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].node_id, "3");
+    }
+
+    #[test]
+    fn configured_indexing_bounds_node_text_and_honors_cjk_mode() {
+        let config = TreeSearchConfig {
+            max_node_chars: 3,
+            cjk_tokenizer: CjkTokenizerMode::Bigram,
+            ..TreeSearchConfig::default()
+        };
+        let index = FTS5Index::with_config(None, &config).unwrap();
+        let mut document = Document::new("bounded", "Bounded", SourceType::Text);
+        let mut node = Node::new("0", "Section");
+        node.text = "知识库目标不会进入索引".into();
+        document.structure.push(node);
+        index.index_document(&document, false).unwrap();
+
+        assert!(!index.search("知识", None, 10).unwrap().is_empty());
+        assert!(index.search("目标", None, 10).unwrap().is_empty());
     }
 
     #[test]
@@ -1368,6 +1671,24 @@ mod tests {
         assert_eq!(all.len(), 1);
 
         assert!(index.load_document("nonexistent").unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupt_persisted_structure_is_reported_instead_of_hidden() {
+        let index = FTS5Index::new(None, None).unwrap();
+        let doc = sample_doc();
+        index.save_document(&doc).unwrap();
+        index
+            .conn
+            .execute(
+                "UPDATE documents SET structure_json = ?1 WHERE doc_id = ?2",
+                params!["{not-json", "doc1"],
+            )
+            .unwrap();
+
+        let error = index.load_document("doc1").unwrap_err();
+        assert!(error.to_string().contains("decode stored structure"));
+        assert!(index.load_all_documents().is_err());
     }
 
     #[test]

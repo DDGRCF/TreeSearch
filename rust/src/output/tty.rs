@@ -5,6 +5,7 @@
 
 use std::io::Write;
 
+use regex::RegexBuilder;
 use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 use unicode_width::UnicodeWidthStr;
 
@@ -23,6 +24,9 @@ fn terminal_width() -> usize {
 fn truncate_to_width(s: &str, max_width: usize) -> String {
     if s.width() <= max_width {
         return s.to_string();
+    }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
     }
     let mut width = 0;
     let mut result = String::new();
@@ -47,37 +51,35 @@ struct HighlightSegment {
 }
 
 fn highlight_terms(text: &str, terms: &[String]) -> Vec<HighlightSegment> {
-    if terms.is_empty() {
+    let mut patterns: Vec<String> = terms
+        .iter()
+        .filter(|term| !term.is_empty())
+        .map(|term| regex::escape(term))
+        .collect();
+    patterns.sort_by_key(|pattern| std::cmp::Reverse(pattern.len()));
+    patterns.dedup();
+    if patterns.is_empty() {
         return vec![HighlightSegment {
             text: text.to_string(),
             is_highlight: false,
         }];
     }
 
-    let text_lower = text.to_lowercase();
+    let Ok(matcher) = RegexBuilder::new(&patterns.join("|"))
+        .case_insensitive(true)
+        .build()
+    else {
+        return vec![HighlightSegment {
+            text: text.to_string(),
+            is_highlight: false,
+        }];
+    };
     let mut segments = Vec::new();
     let mut last_end = 0;
 
-    // Collect all match ranges
-    let mut matches: Vec<(usize, usize)> = Vec::new();
-    for term in terms {
-        let term_lower = term.to_lowercase();
-        let mut start = 0;
-        while let Some(pos) = text_lower[start..].find(&term_lower) {
-            let abs_pos = start + pos;
-            matches.push((abs_pos, abs_pos + term.len()));
-            start = abs_pos + 1;
-        }
-    }
-
-    // Sort by start position
-    matches.sort_by_key(|m| m.0);
-
-    // Merge overlapping ranges and build segments
-    for (mstart, mend) in matches {
-        if mstart < last_end {
-            continue; // Skip overlapping
-        }
+    // Regex offsets always refer to valid boundaries in the original UTF-8 text.
+    for matched in matcher.find_iter(text) {
+        let (mstart, mend) = (matched.start(), matched.end());
         if mstart > last_end {
             segments.push(HighlightSegment {
                 text: text[last_end..mstart].to_string(),
@@ -120,7 +122,12 @@ impl TtyOutput {
     }
 
     /// Write a single result entry to the buffer with colors.
-    fn write_result(&self, buf: &mut Buffer, result: &SearchResult, _verbose: u8) -> std::io::Result<()> {
+    fn write_result(
+        &self,
+        buf: &mut Buffer,
+        result: &SearchResult,
+        _verbose: u8,
+    ) -> std::io::Result<()> {
         let tw = terminal_width();
 
         // Header: source_path [source_type] (score: X.XX)
@@ -137,7 +144,11 @@ impl TtyOutput {
             let crumb_len = result.breadcrumb.len();
             for (i, crumb) in result.breadcrumb.iter().enumerate() {
                 let is_last = i == crumb_len - 1;
-                let prefix = if is_last { "  └── " } else { "  ├── " };
+                let prefix = if is_last {
+                    "  └── "
+                } else {
+                    "  ├── "
+                };
 
                 buf.set_color(ColorSpec::new().set_fg(Some(Color::White)).set_dimmed(true))?;
                 write!(buf, "{}", prefix)?;
@@ -162,11 +173,7 @@ impl TtyOutput {
             let segments = highlight_terms(&result.title, &self.query_terms);
             for seg in &segments {
                 if seg.is_highlight {
-                    buf.set_color(
-                        ColorSpec::new()
-                            .set_fg(Some(Color::Yellow))
-                            .set_bold(true),
-                    )?;
+                    buf.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
                 } else {
                     buf.set_color(ColorSpec::new().set_bold(true))?;
                 }
@@ -183,11 +190,7 @@ impl TtyOutput {
             let segments = highlight_terms(&summary, &self.query_terms);
             for seg in &segments {
                 if seg.is_highlight {
-                    buf.set_color(
-                        ColorSpec::new()
-                            .set_fg(Some(Color::Yellow))
-                            .set_bold(true),
-                    )?;
+                    buf.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
                 } else {
                     buf.reset()?;
                 }
@@ -204,11 +207,7 @@ impl TtyOutput {
             let segments = highlight_terms(&text, &self.query_terms);
             for seg in &segments {
                 if seg.is_highlight {
-                    buf.set_color(
-                        ColorSpec::new()
-                            .set_fg(Some(Color::Yellow))
-                            .set_bold(true),
-                    )?;
+                    buf.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)).set_bold(true))?;
                 } else {
                     buf.reset()?;
                 }
@@ -304,10 +303,32 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_to_tiny_width_never_exceeds_limit() {
+        for width in 0..=3 {
+            assert_eq!(truncate_to_width("知识库", width).width(), width);
+        }
+    }
+
+    #[test]
     fn test_highlight_terms_no_terms() {
         let segs = highlight_terms("hello world", &[]);
         assert_eq!(segs.len(), 1);
         assert!(!segs[0].is_highlight);
+    }
+
+    #[test]
+    fn test_highlight_terms_is_utf8_safe_and_ignores_empty_terms() {
+        let segments = highlight_terms("İstanbul 知识库", &[String::new(), "知识".into()]);
+        assert_eq!(
+            segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+            "İstanbul 知识库"
+        );
+        assert!(segments
+            .iter()
+            .any(|segment| segment.is_highlight && segment.text == "知识"));
     }
 
     #[test]

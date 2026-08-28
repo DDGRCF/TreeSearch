@@ -1,10 +1,100 @@
-# TreeSearch Rust CLI
+# TreeSearch Rust Library and CLI
 
-`treesearch` is a fast, structure-aware document search CLI built with Rust.
+`treesearch` is a fast, structure-aware document search library and optional CLI built with Rust.
 It indexes files into a local SQLite FTS5 database and searches by document
 structure instead of chunking text into arbitrary fragments.
 
-This crate publishes the `ts` executable.
+The default features preserve the complete `ts` executable. Embedding applications
+can disable defaults and compile only the parsers they actually use.
+
+## Library embedding
+
+For an application that constructs authorized documents itself and only parses
+Markdown/plain text, use the dependency-minimal profile:
+
+```toml
+treesearch = { git = "https://github.com/DDGRCF/TreeSearch.git", default-features = false, features = ["parser-markdown", "parser-plaintext"] }
+```
+
+This profile keeps the in-memory flat/tree ranking engine, document model,
+Markdown hierarchy, plain-text hierarchy, scorer, and dependency-free CJK
+bigram/character tokenizers. The host supplies its authorized candidate scores
+to `engine::candidate_search::search_with_scores_strict`; TreeSearch performs
+mode routing, traversal, path aggregation, and final ranking. It does not
+compile SQLite/FTS5, the CLI, directory crawler, progress rendering, output
+formatters, HTML/config/code parsers, or jieba.
+
+Available opt-in features:
+
+| Feature | Capability |
+| --- | --- |
+| `cli` (default) | Full backward-compatible `ts` binary and all built-ins |
+| `directory-indexer` | `.gitignore`-aware parallel directory crawling |
+| `progress` | Indexing progress bars |
+| `output` | JSON/plain/TTY renderers |
+| `sqlite-fts` | Optional rusqlite/libsqlite3-sys adapter linked to a host/system SQLite |
+| `sqlite-bundled` | `sqlite-fts` plus a bundled SQLite build; used by the default CLI |
+| `cjk-jieba` | Jieba segmentation and custom dictionaries |
+| `parser-markdown` | Markdown heading hierarchy |
+| `parser-plaintext` | Plain-text paragraph hierarchy |
+| `parser-html` | Browser-grade HTML parsing |
+| `parser-config` | JSON, YAML, and TOML parsing |
+| `parser-code` | Source-code structure parsing |
+| `parsers-all` | Every built-in parser |
+
+`ParserRegistry::empty()` plus `ParserRegistry::register()` lets a host add
+domain-specific parsers without enabling unrelated built-ins.
+
+The default `cli` feature includes `sqlite-bundled`, so existing CLI installs
+remain self-contained. Library consumers should make an explicit choice:
+
+- omit both SQLite features for pure in-memory candidate reranking;
+- enable `sqlite-fts` to share the host/system `sqlite3` link;
+- enable `sqlite-bundled` only for a self-contained SQLite build.
+
+The minimal Markdown/plain-text profile contains neither `rusqlite` nor
+`libsqlite3-sys`. `rusqlite 0.37` and SQLx 0.9 both resolve
+`libsqlite3-sys 0.35`, but disabling TreeSearch's SQLite adapter is still the
+recommended choice when the host does not use local FTS5.
+
+## Candidate-search API
+
+Hosts that already perform authorization and candidate retrieval should use the
+strict API:
+
+```rust
+use treesearch::config::{SearchMode, TreeSearchConfig};
+use treesearch::engine::candidate_search::{
+    ScoredNodeCandidate, search_with_candidates_strict,
+};
+
+let mut config = TreeSearchConfig::default();
+config.search_mode = SearchMode::Auto;
+let outcome = search_with_candidates_strict(
+    "token validation",
+    &documents,
+    &[ScoredNodeCandidate::new("guide", "auth", 0.92)],
+    &config,
+)?;
+```
+
+Strict search rejects empty queries, duplicate document/node identities,
+unknown candidates, non-finite/out-of-range scores, invalid source ranges, and
+invalid frontier thresholds. Scores must be globally calibrated in `0.0..=1.0`.
+The lenient API ignores invalid candidates and, when raw positive scores exceed
+`1.0`, divides the accepted set by its global maximum without destroying
+cross-document ordering.
+
+All result ordering has explicit `(score, doc_id, node_id)` tie-breaks.
+`top_k_docs` limits distinct returned documents and `max_nodes_per_doc` limits
+nodes from each selected document. Tree paths report the actual retrieval
+anchor and UTF-8-safe snippets. See [API.md](API.md) for the full contract.
+
+Resource policies are active rather than documentary: `max_concurrency` builds
+a request-local Rayon pool for directory parsing, `max_node_chars` bounds text
+examined by scoring/FTS indexing, and `max_result_chars` bounds returned node
+text on UTF-8 character boundaries. SQLite transfers at most 5,000 raw matches
+into memory before bounded TreeSearch reranking.
 
 ## Install
 
@@ -135,8 +225,9 @@ Useful options:
 
 ## Documentation
 
-- Project homepage: <https://github.com/shibing624/TreeSearch>
+- Project homepage: <https://github.com/DDGRCF/TreeSearch>
 - API docs: <https://docs.rs/treesearch>
+- Embedding contract: [API.md](API.md)
 
 ## License
 

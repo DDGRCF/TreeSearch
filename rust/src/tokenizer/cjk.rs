@@ -1,15 +1,20 @@
 //! CJK-specific tokenization strategies.
 //!
-//! Provides jieba word segmentation, bigram, and single-character tokenization
-//! for Chinese/Japanese/Korean text. Ported from Python `treesearch/tokenizer.py`.
+//! Provides always-available bigram/character tokenizers and optional jieba segmentation.
 
+#[cfg(feature = "cjk-jieba")]
 use jieba_rs::Jieba;
+#[cfg(feature = "cjk-jieba")]
 use std::fs::File;
+#[cfg(feature = "cjk-jieba")]
 use std::io::BufReader;
 use std::path::PathBuf;
+#[cfg(feature = "cjk-jieba")]
 use std::sync::{LazyLock, Mutex, RwLock};
+#[cfg(feature = "cjk-jieba")]
 use std::time::SystemTime;
 
+#[cfg(feature = "cjk-jieba")]
 use tracing::{info, warn};
 
 /// Global jieba instance (lazy-loaded, thread-safe, mutable).
@@ -19,6 +24,7 @@ use tracing::{info, warn};
 /// which has near-zero overhead in the absence of writers.
 ///
 /// Mirrors the Python `_jieba_tokenizer` private Tokenizer instance.
+#[cfg(feature = "cjk-jieba")]
 static JIEBA: LazyLock<RwLock<Jieba>> = LazyLock::new(|| RwLock::new(Jieba::new()));
 
 /// Fingerprint of the user-dict configuration last applied to [`JIEBA`].
@@ -26,8 +32,11 @@ static JIEBA: LazyLock<RwLock<Jieba>> = LazyLock::new(|| RwLock::new(Jieba::new(
 /// Comparing this against the current config lets us skip rebuilding
 /// jieba when nothing changed — and force a rebuild when a dict file's
 /// mtime/size or the in-memory word lists differ.
+#[cfg(feature = "cjk-jieba")]
 type FileSig = (PathBuf, Option<u128>, Option<u64>);
+#[cfg(feature = "cjk-jieba")]
 type Fingerprint = (Vec<FileSig>, Vec<String>, Vec<String>);
+#[cfg(feature = "cjk-jieba")]
 static USER_DICT_FP: LazyLock<Mutex<Option<Fingerprint>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Compute the fingerprint of a user-dict configuration.
@@ -35,6 +44,7 @@ static USER_DICT_FP: LazyLock<Mutex<Option<Fingerprint>>> = LazyLock::new(|| Mut
 /// Files contribute `(path, mtime_ns, size)`; missing files contribute
 /// `(path, None, None)` — that way an admin restoring a deleted file
 /// also forces a reload.
+#[cfg(feature = "cjk-jieba")]
 fn compute_fingerprint(paths: &[PathBuf], words: &[String], del_words: &[String]) -> Fingerprint {
     let file_sigs: Vec<FileSig> = paths
         .iter()
@@ -60,6 +70,7 @@ fn compute_fingerprint(paths: &[PathBuf], words: &[String], del_words: &[String]
 ///   `"石墨烯 9000"`      -> word + freq
 ///   `"石墨烯 9000 n"`    -> word + freq + tag
 ///   `"石墨烯 n"`         -> word + tag (when 2nd token is non-numeric)
+#[cfg(feature = "cjk-jieba")]
 fn parse_user_word(entry: &str) -> Option<(String, Option<usize>, Option<String>)> {
     let entry = entry.trim();
     if entry.is_empty() {
@@ -82,12 +93,8 @@ fn parse_user_word(entry: &str) -> Option<(String, Option<usize>, Option<String>
 }
 
 /// Apply user-dict files / words / del_words to a fresh jieba instance.
-fn apply_user_dicts(
-    jieba: &mut Jieba,
-    paths: &[PathBuf],
-    words: &[String],
-    del_words: &[String],
-) {
+#[cfg(feature = "cjk-jieba")]
+fn apply_user_dicts(jieba: &mut Jieba, paths: &[PathBuf], words: &[String], del_words: &[String]) {
     for path in paths {
         match File::open(path) {
             Ok(file) => {
@@ -128,6 +135,7 @@ fn apply_user_dicts(
 /// Designed to be called once at process startup (e.g. from `main`)
 /// after the [`crate::config::TreeSearchConfig`] is finalized. May be
 /// called repeatedly — useful in tests and long-running processes.
+#[cfg(feature = "cjk-jieba")]
 pub fn configure_jieba(paths: &[PathBuf], words: &[String], del_words: &[String]) {
     let new_fp = compute_fingerprint(paths, words, del_words);
 
@@ -142,6 +150,13 @@ pub fn configure_jieba(paths: &[PathBuf], words: &[String], del_words: &[String]
     *current_fp = Some(new_fp);
 }
 
+/// Accepts jieba configuration without loading jieba in dependency-minimal builds.
+///
+/// Enable the `cjk-jieba` feature to apply these dictionaries. Without it,
+/// `Auto` and `Jieba` modes deterministically use the built-in bigram tokenizer.
+#[cfg(not(feature = "cjk-jieba"))]
+pub fn configure_jieba(_paths: &[PathBuf], _words: &[String], _del_words: &[String]) {}
+
 /// Convenience wrapper that pulls jieba user-dict fields off
 /// `TreeSearchConfig` and forwards them to [`configure_jieba`].
 pub fn configure_from(config: &crate::config::TreeSearchConfig) {
@@ -153,7 +168,7 @@ pub fn configure_from(config: &crate::config::TreeSearchConfig) {
 }
 
 /// Reset jieba state (used by tests).
-#[cfg(test)]
+#[cfg(all(test, feature = "cjk-jieba"))]
 pub fn reset_jieba() {
     let mut jieba = JIEBA.write().expect("JIEBA RwLock poisoned");
     *jieba = Jieba::new();
@@ -167,12 +182,16 @@ pub fn reset_jieba() {
 /// tokens produced by jieba. Honors any user dict installed via
 /// [`configure_jieba`].
 ///
+/// When the crate is compiled without `cjk-jieba`, this compatibility entry
+/// point falls back to deterministic CJK bigrams instead of failing at runtime.
+///
 /// # Example
 /// ```
 /// let tokens = treesearch::tokenizer::cjk::jieba_cut("机器学习是人工智能的子领域");
 /// assert!(tokens.contains(&"机器".to_string()));
 /// assert!(tokens.contains(&"学习".to_string()));
 /// ```
+#[cfg(feature = "cjk-jieba")]
 pub fn jieba_cut(text: &str) -> Vec<String> {
     let jieba = JIEBA.read().expect("JIEBA RwLock poisoned");
     jieba
@@ -183,13 +202,19 @@ pub fn jieba_cut(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Tokenizes with the dependency-free bigram fallback when jieba is disabled.
+#[cfg(not(feature = "cjk-jieba"))]
+pub fn jieba_cut(text: &str) -> Vec<String> {
+    bigrams(text)
+}
 
 /// Bigram tokenization for CJK text (fallback when jieba is not desired).
 ///
 /// CJK characters are paired into overlapping bigrams:
 /// "机器学习" -> ["机器", "器学", "学习"]
 ///
-/// Non-CJK characters are emitted individually (lowercased) when non-whitespace.
+/// Adjacent non-CJK letters/digits are retained as lowercase words, so mixed
+/// queries such as `API接口` do not lose the ASCII term in dependency-minimal builds.
 ///
 /// # Example
 /// ```
@@ -199,17 +224,21 @@ pub fn jieba_cut(text: &str) -> Vec<String> {
 pub fn bigrams(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cjk_buf: Vec<char> = Vec::new();
+    let mut word_buf = String::new();
 
     for ch in text.chars() {
         if is_cjk_char(ch) {
+            flush_word(&mut word_buf, &mut tokens);
             cjk_buf.push(ch);
         } else {
             if !cjk_buf.is_empty() {
                 tokens.extend(bigrams_from_chars(&cjk_buf));
                 cjk_buf.clear();
             }
-            if !ch.is_whitespace() {
-                tokens.push(ch.to_lowercase().to_string());
+            if ch.is_alphanumeric() || ch == '_' {
+                word_buf.extend(ch.to_lowercase());
+            } else {
+                flush_word(&mut word_buf, &mut tokens);
             }
         }
     }
@@ -218,8 +247,16 @@ pub fn bigrams(text: &str) -> Vec<String> {
     if !cjk_buf.is_empty() {
         tokens.extend(bigrams_from_chars(&cjk_buf));
     }
+    flush_word(&mut word_buf, &mut tokens);
 
     tokens
+}
+
+/// Moves one accumulated non-CJK word into the token stream.
+fn flush_word(word: &mut String, tokens: &mut Vec<String>) {
+    if !word.is_empty() {
+        tokens.push(std::mem::take(word));
+    }
 }
 
 /// Generate bigrams from a slice of CJK characters.
@@ -315,9 +352,16 @@ mod tests {
     fn test_bigrams_mixed() {
         let tokens = bigrams("机器AI学习");
         assert!(tokens.contains(&"机器".to_string()));
-        assert!(tokens.contains(&"a".to_string()));
-        assert!(tokens.contains(&"i".to_string()));
+        assert!(tokens.contains(&"ai".to_string()));
         assert!(tokens.contains(&"学习".to_string()));
+    }
+
+    #[test]
+    fn test_bigrams_preserve_mixed_ascii_words_and_numbers() {
+        assert_eq!(
+            bigrams("TreeSearch知识库v2"),
+            vec!["treesearch", "知识", "识库", "v2"]
+        );
     }
 
     #[test]
@@ -364,10 +408,14 @@ mod tests {
     // call reset_jieba() in setup/teardown to keep things hermetic.
     // ---------------------------------------------------------------
 
+    #[cfg(feature = "cjk-jieba")]
     use std::io::Write;
+    #[cfg(feature = "cjk-jieba")]
     use std::sync::Mutex as StdMutex;
+    #[cfg(feature = "cjk-jieba")]
     static USERDICT_TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
+    #[cfg(feature = "cjk-jieba")]
     fn with_clean_jieba<F: FnOnce()>(f: F) {
         let _guard = USERDICT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_jieba();
@@ -375,6 +423,7 @@ mod tests {
         reset_jieba();
     }
 
+    #[cfg(feature = "cjk-jieba")]
     #[test]
     fn test_configure_jieba_inline_pure_word() {
         with_clean_jieba(|| {
@@ -385,25 +434,29 @@ mod tests {
             // After configure: pure-word entry (no freq, no tag).
             configure_jieba(&[], &["超级灵魂引擎".to_string()], &[]);
             let tokens = jieba_cut("超级灵魂引擎是新框架");
-            assert!(tokens.iter().any(|t| t == "超级灵魂引擎"),
-                "expected '超级灵魂引擎' in {:?}", tokens);
+            assert!(
+                tokens.iter().any(|t| t == "超级灵魂引擎"),
+                "expected '超级灵魂引擎' in {:?}",
+                tokens
+            );
         });
     }
 
+    #[cfg(feature = "cjk-jieba")]
     #[test]
     fn test_configure_jieba_inline_word_with_freq_and_tag() {
         with_clean_jieba(|| {
-            configure_jieba(
-                &[],
-                &["树搜索引擎 9000 n".to_string()],
-                &[],
-            );
+            configure_jieba(&[], &["树搜索引擎 9000 n".to_string()], &[]);
             let tokens = jieba_cut("树搜索引擎支持FTS5检索");
-            assert!(tokens.iter().any(|t| t == "树搜索引擎"),
-                "expected '树搜索引擎' in {:?}", tokens);
+            assert!(
+                tokens.iter().any(|t| t == "树搜索引擎"),
+                "expected '树搜索引擎' in {:?}",
+                tokens
+            );
         });
     }
 
+    #[cfg(feature = "cjk-jieba")]
     #[test]
     fn test_configure_jieba_dict_file() {
         with_clean_jieba(|| {
@@ -419,6 +472,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "cjk-jieba")]
     #[test]
     fn test_configure_jieba_del_words_suppresses_known_term() {
         with_clean_jieba(|| {
@@ -427,11 +481,15 @@ mod tests {
 
             configure_jieba(&[], &[], &["计算机科学".to_string()]);
             let tokens = jieba_cut("计算机科学很有趣");
-            assert!(!tokens.iter().any(|t| t == "计算机科学"),
-                "expected '计算机科学' to be suppressed in {:?}", tokens);
+            assert!(
+                !tokens.iter().any(|t| t == "计算机科学"),
+                "expected '计算机科学' to be suppressed in {:?}",
+                tokens
+            );
         });
     }
 
+    #[cfg(feature = "cjk-jieba")]
     #[test]
     fn test_configure_jieba_idempotent_no_reload() {
         with_clean_jieba(|| {
@@ -446,6 +504,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "cjk-jieba")]
     #[test]
     fn test_configure_jieba_runtime_reload_on_change() {
         with_clean_jieba(|| {
@@ -459,6 +518,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "cjk-jieba")]
     #[test]
     fn test_parse_user_word_variants() {
         assert_eq!(

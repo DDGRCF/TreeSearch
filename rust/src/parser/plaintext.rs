@@ -1,3 +1,5 @@
+//! Parses plain text paragraphs with UTF-8-safe titles and exact line ranges.
+
 use crate::document::{Document, Node, SourceType};
 use anyhow::Result;
 use std::path::Path;
@@ -35,27 +37,16 @@ impl super::Parser for PlainTextParser {
         }
 
         let paragraphs = split_paragraphs(content);
-        let mut line_offset: u32 = 1;
 
-        for para in &paragraphs {
-            let trimmed = para.trim();
-            if trimmed.is_empty() {
-                line_offset += para.lines().count().max(1) as u32;
-                continue;
-            }
-
-            let title = make_title(trimmed);
-            let line_count = trimmed.lines().count() as u32;
+        for paragraph in paragraphs {
+            let title = make_title(&paragraph.text);
 
             let mut node = Node::new("", &title);
-            node.text = trimmed.to_string();
-            node.line_start = Some(line_offset);
-            node.line_end = Some(line_offset + line_count.saturating_sub(1));
+            node.text = paragraph.text;
+            node.line_start = Some(paragraph.line_start);
+            node.line_end = Some(paragraph.line_end);
 
             doc.structure.push(node);
-
-            // Advance past this paragraph text lines + separator gap.
-            line_offset += para.lines().count().max(1) as u32 + 1;
         }
 
         doc.assign_node_ids();
@@ -63,49 +54,59 @@ impl super::Parser for PlainTextParser {
     }
 }
 
-/// Split content into paragraphs separated by one or more blank lines.
-fn split_paragraphs(content: &str) -> Vec<&str> {
+/// One normalized paragraph with exact one-based source line bounds.
+struct Paragraph {
+    text: String,
+    line_start: u32,
+    line_end: u32,
+}
+
+/// Splits content on blank lines while preserving exact source line bounds.
+fn split_paragraphs(content: &str) -> Vec<Paragraph> {
+    /// Flushes an accumulated non-empty paragraph into the result list.
+    fn flush(
+        lines: &mut Vec<String>,
+        line_start: &mut Option<u32>,
+        line_end: u32,
+        result: &mut Vec<Paragraph>,
+    ) {
+        let Some(start) = line_start.take() else {
+            return;
+        };
+        result.push(Paragraph {
+            text: lines.join("\n").trim().to_string(),
+            line_start: start,
+            line_end,
+        });
+        lines.clear();
+    }
+
     let mut result = Vec::new();
-    let mut start = 0;
-    let bytes = content.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        if bytes[i] == b'\n' {
-            let mut j = i + 1;
-            // Skip horizontal whitespace.
-            while j < len && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\r') {
-                j += 1;
-            }
-            if j < len && bytes[j] == b'\n' {
-                // Paragraph break found.
-                if start < i {
-                    result.push(&content[start..i]);
-                }
-                // Skip past all consecutive blank lines.
-                let mut k = j + 1;
-                while k < len
-                    && (bytes[k] == b'\n'
-                        || bytes[k] == b'\r'
-                        || bytes[k] == b' '
-                        || bytes[k] == b'\t')
-                {
-                    k += 1;
-                }
-                start = k;
-                i = k;
-                continue;
-            }
+    let mut paragraph_lines = Vec::new();
+    let mut paragraph_start = None;
+    let mut previous_content_line = 0;
+    for (index, raw_line) in content.lines().enumerate() {
+        let line_number = u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX);
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            flush(
+                &mut paragraph_lines,
+                &mut paragraph_start,
+                previous_content_line,
+                &mut result,
+            );
+            continue;
         }
-        i += 1;
+        paragraph_start.get_or_insert(line_number);
+        previous_content_line = line_number;
+        paragraph_lines.push(line.to_string());
     }
-
-    // Trailing paragraph.
-    if start < len {
-        result.push(&content[start..]);
-    }
-
+    flush(
+        &mut paragraph_lines,
+        &mut paragraph_start,
+        previous_content_line,
+        &mut result,
+    );
     result
 }
 
@@ -113,22 +114,20 @@ fn split_paragraphs(content: &str) -> Vec<&str> {
 fn make_title(text: &str) -> String {
     let first_line = text.lines().next().unwrap_or("");
     let trimmed = first_line.trim();
-    if trimmed.len() <= MAX_TITLE_LEN {
+    if trimmed.chars().count() <= MAX_TITLE_LEN {
         trimmed.to_string()
     } else {
-        // Truncate at a char boundary.
-        let mut end = MAX_TITLE_LEN;
-        while !trimmed.is_char_boundary(end) && end > 0 {
-            end -= 1;
-        }
-        format!("{}...", &trimmed[..end])
+        format!(
+            "{}...",
+            trimmed.chars().take(MAX_TITLE_LEN).collect::<String>()
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::Parser;
     use super::*;
+    use crate::parser::Parser;
 
     fn parse(content: &str) -> Document {
         let parser = PlainTextParser;
@@ -185,6 +184,16 @@ mod tests {
     }
 
     #[test]
+    fn test_line_numbers_account_for_leading_and_repeated_blank_lines() {
+        let content = "\n\nFirst\nline\n\n\n\nSecond\r\nthird\r\n";
+        let doc = parse(content);
+        assert_eq!(doc.structure[0].line_start, Some(3));
+        assert_eq!(doc.structure[0].line_end, Some(4));
+        assert_eq!(doc.structure[1].line_start, Some(8));
+        assert_eq!(doc.structure[1].line_end, Some(9));
+    }
+
+    #[test]
     fn test_node_ids_assigned() {
         let content = "A\n\nB\n\nC";
         let doc = parse(content);
@@ -223,5 +232,6 @@ mod tests {
         let doc = parse(&long_cjk);
         // Should truncate without panicking (char boundary safe).
         assert!(doc.structure[0].title.ends_with("..."));
+        assert_eq!(doc.structure[0].title.chars().count(), MAX_TITLE_LEN + 3);
     }
 }

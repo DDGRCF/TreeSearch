@@ -1,3 +1,5 @@
+//! Defines search, traversal, indexing, and optional tokenizer policies.
+
 use std::env;
 use std::path::PathBuf;
 
@@ -40,8 +42,8 @@ pub struct TreeSearchConfig {
     // Tokenizer
     pub cjk_tokenizer: CjkTokenizerMode,
 
-    // Jieba custom dictionary (improves Chinese retrieval accuracy for
-    // domain-specific terms / brand names / multi-word entities).
+    // Jieba custom dictionary (active only with the `cjk-jieba` feature;
+    // dependency-minimal builds use deterministic bigrams for Auto/Jieba).
     //   - `jieba_user_dict_paths`: file paths in jieba dict format
     //                              (one entry per line: "word [freq] [tag]")
     //   - `jieba_user_words`: in-memory entries; each string is parsed as
@@ -71,12 +73,19 @@ impl SearchMode {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    /// Parses a mode name, falling back to [`SearchMode::Auto`].
+    pub fn parse_lossy(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "flat" => Self::Flat,
             "tree" => Self::Tree,
             _ => Self::Auto,
         }
+    }
+
+    /// Parses a mode name with the historical forgiving API.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        Self::parse_lossy(s)
     }
 }
 
@@ -89,13 +98,20 @@ pub enum CjkTokenizerMode {
 }
 
 impl CjkTokenizerMode {
-    pub fn from_str(s: &str) -> Self {
+    /// Parses a tokenizer name, falling back to [`CjkTokenizerMode::Auto`].
+    pub fn parse_lossy(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "jieba" => Self::Jieba,
             "bigram" => Self::Bigram,
             "char" => Self::Char,
             _ => Self::Auto,
         }
+    }
+
+    /// Parses a tokenizer name with the historical forgiving API.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        Self::parse_lossy(s)
     }
 }
 
@@ -145,10 +161,10 @@ impl TreeSearchConfig {
         let mut config = Self::default();
 
         if let Ok(v) = env::var("TREESEARCH_CJK_TOKENIZER") {
-            config.cjk_tokenizer = CjkTokenizerMode::from_str(&v);
+            config.cjk_tokenizer = CjkTokenizerMode::parse_lossy(&v);
         }
         if let Ok(v) = env::var("TREESEARCH_SEARCH_MODE") {
-            config.search_mode = SearchMode::from_str(&v);
+            config.search_mode = SearchMode::parse_lossy(&v);
         }
         if let Ok(v) = env::var("TREESEARCH_MAX_NODES_PER_DOC") {
             if let Ok(n) = v.parse() {
@@ -222,9 +238,9 @@ mod tests {
 
     #[test]
     fn test_search_mode_parse() {
-        assert_eq!(SearchMode::from_str("flat"), SearchMode::Flat);
-        assert_eq!(SearchMode::from_str("TREE"), SearchMode::Tree);
-        assert_eq!(SearchMode::from_str("blah"), SearchMode::Auto);
+        assert_eq!(SearchMode::parse_lossy("flat"), SearchMode::Flat);
+        assert_eq!(SearchMode::parse_lossy("TREE"), SearchMode::Tree);
+        assert_eq!(SearchMode::parse_lossy("blah"), SearchMode::Auto);
     }
 
     #[test]

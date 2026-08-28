@@ -1,3 +1,5 @@
+//! Parses visible HTML body content into heading-based document trees.
+
 use crate::document::{Document, Node, SourceType};
 use anyhow::Result;
 use scraper::{Html, Node as HtmlNode, Selector};
@@ -46,34 +48,48 @@ impl super::Parser for HtmlParser {
         let mut stack: Vec<(u8, Node)> = Vec::new();
         let mut roots: Vec<Node> = Vec::new();
         let mut current_text = String::new();
+        let mut saw_heading = false;
 
-        for node_ref in html.tree.nodes() {
+        let traversal_nodes: Vec<_> = if let Ok(selector) = Selector::parse("body") {
+            html.select(&selector)
+                .next()
+                .and_then(|body| html.tree.get(body.id()))
+                .map(|body| body.descendants().collect())
+                .unwrap_or_else(|| html.tree.nodes().collect())
+        } else {
+            html.tree.nodes().collect()
+        };
+
+        for node_ref in traversal_nodes {
             match node_ref.value() {
                 HtmlNode::Element(el) => {
-                    if let Some(level) = heading_level(el.name()) {
-                        // Flush accumulated text to current node.
-                        flush_text(&mut stack, &mut roots, &mut current_text);
-                        // Collapse deeper headings.
-                        collapse_stack(&mut stack, &mut roots, level);
-                        // Extract heading text from child text nodes.
-                        let mut title = String::new();
-                        for child in node_ref.children() {
-                            collect_all_text(child, &mut title);
-                        }
-                        let node = Node::new("", title.trim());
-                        stack.push((level, node));
+                    let Some(level) = heading_level(el.name()) else {
+                        continue;
+                    };
+                    saw_heading = true;
+                    // Flush accumulated text to current node.
+                    flush_text(&mut stack, &mut roots, &mut current_text);
+                    // Collapse deeper headings.
+                    collapse_stack(&mut stack, &mut roots, level);
+                    // Extract heading text from child text nodes.
+                    let mut title = String::new();
+                    for child in node_ref.children() {
+                        collect_all_text(child, &mut title);
                     }
+                    let node = Node::new("", title.trim());
+                    stack.push((level, node));
                 }
-                HtmlNode::Text(text) => {
+                HtmlNode::Text(text)
+                    if !is_inside_heading(&html, node_ref.id())
+                        && !is_inside_hidden_element(&html, node_ref.id()) =>
+                {
                     // Skip text that belongs to heading elements (already collected above).
-                    if !is_inside_heading(&html, node_ref.id()) {
-                        let t = text.trim();
-                        if !t.is_empty() {
-                            if !current_text.is_empty() {
-                                current_text.push(' ');
-                            }
-                            current_text.push_str(t);
+                    let t = text.trim();
+                    if !t.is_empty() {
+                        if !current_text.is_empty() {
+                            current_text.push(' ');
                         }
+                        current_text.push_str(t);
                     }
                 }
                 _ => {}
@@ -84,6 +100,12 @@ impl super::Parser for HtmlParser {
         flush_text(&mut stack, &mut roots, &mut current_text);
         // Collapse entire stack.
         collapse_stack(&mut stack, &mut roots, 0);
+
+        if !saw_heading {
+            if let Some(root) = roots.first_mut() {
+                root.title = file_name.clone();
+            }
+        }
 
         // Fallback: if no headings found, create a single node with all body text.
         if roots.is_empty() && !content.trim().is_empty() {
@@ -135,16 +157,36 @@ fn is_inside_heading(html: &Html, node_id: ego_tree::NodeId) -> bool {
     false
 }
 
-
-/// Recursively collect all text from a node and its descendants.
-fn collect_all_text(node_ref: ego_tree::NodeRef<'_, scraper::Node>, out: &mut String) {
-    match node_ref.value() {
-        HtmlNode::Text(t) => {
-            out.push_str(t);
+/// Checks whether a node belongs to non-visible metadata or executable markup.
+fn is_inside_hidden_element(html: &Html, node_id: ego_tree::NodeId) -> bool {
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let Some(node) = html.tree.get(id) else {
+            break;
+        };
+        if let HtmlNode::Element(element) = node.value() {
+            if matches!(
+                element.name(),
+                "head" | "script" | "style" | "noscript" | "template" | "svg"
+            ) {
+                return true;
+            }
         }
-        _ => {
-            for child in node_ref.children() {
-                collect_all_text(child, out);
+        current = node.parent().map(|parent| parent.id());
+    }
+    false
+}
+
+/// Iteratively collects visible text from a node and its descendants.
+fn collect_all_text(node_ref: ego_tree::NodeRef<'_, scraper::Node>, out: &mut String) {
+    for descendant in node_ref.descendants() {
+        if let HtmlNode::Text(text) = descendant.value() {
+            let text = text.trim();
+            if !text.is_empty() {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(text);
             }
         }
     }
@@ -191,7 +233,7 @@ fn collapse_stack(stack: &mut Vec<(u8, Node)>, roots: &mut Vec<Node>, target_lev
     }
 }
 
-fn flush_text(stack: &mut Vec<(u8, Node)>, roots: &mut Vec<Node>, text: &mut String) {
+fn flush_text(stack: &mut [(u8, Node)], roots: &mut Vec<Node>, text: &mut String) {
     let trimmed = text.trim().to_string();
     if trimmed.is_empty() {
         text.clear();
@@ -214,8 +256,8 @@ fn flush_text(stack: &mut Vec<(u8, Node)>, roots: &mut Vec<Node>, text: &mut Str
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::Parser;
     use super::*;
+    use crate::parser::Parser;
 
     fn parse(content: &str) -> Document {
         let parser = HtmlParser;
@@ -265,6 +307,7 @@ mod tests {
     fn test_no_headings() {
         let doc = parse("<p>Just text</p><p>More text</p>");
         assert_eq!(doc.structure.len(), 1);
+        assert_eq!(doc.structure[0].title, "test.html");
         assert!(doc.structure[0].text.contains("Just text"));
     }
 
@@ -297,6 +340,8 @@ mod tests {
         assert_eq!(doc.doc_description, "Test Page");
         // The parser should produce at least one node from the document
         assert!(!doc.structure.is_empty());
+        assert_eq!(doc.structure[0].title, "Main Title");
+        assert!(!doc.structure[0].text.contains("Test Page"));
     }
 
     #[test]
@@ -311,6 +356,16 @@ mod tests {
     fn test_heading_with_nested_tags() {
         let doc = parse("<h1>Hello <strong>World</strong></h1><p>Body</p>");
         assert_eq!(doc.structure[0].title, "Hello World");
+    }
+
+    #[test]
+    fn test_hidden_script_and_style_text_is_not_indexed() {
+        let doc = parse(
+            "<html><body><script>secretToken()</script><style>.secret{}</style><h1>Visible</h1><p>Body</p></body></html>",
+        );
+        assert_eq!(doc.structure.len(), 1);
+        assert_eq!(doc.structure[0].title, "Visible");
+        assert_eq!(doc.structure[0].text, "Body");
     }
 
     #[test]

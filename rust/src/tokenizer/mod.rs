@@ -29,8 +29,7 @@ static RE_SPLIT_EN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\W+").unwrap
 /// Regex to strip FTS5 special characters.
 /// Keeps only word characters (letters, digits, underscore) and CJK ranges.
 static RE_FTS5_SPECIAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[^\w\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]")
-        .unwrap()
+    Regex::new(r"[^\w\u4e00-\u9fff\u3400-\u4dbf\u3040-\u309f\u30a0-\u30ff\uac00-\ud7af]").unwrap()
 });
 
 /// FTS5 operators that must NOT be tokenized.
@@ -43,19 +42,16 @@ const FTS5_OPERATORS: &[&str] = &["AND", "OR", "NOT", "NEAR"];
 /// English stop words.
 static EN_STOPWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
-        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
-        "have", "has", "had", "do", "does", "did", "will", "would", "could",
-        "should", "may", "might", "shall", "can", "of", "in", "to", "for",
-        "with", "on", "at", "by", "from", "as", "into", "through", "during",
-        "before", "after", "above", "below", "between", "and", "but", "or",
-        "not", "no", "so", "if", "than", "too", "very", "just", "about",
-        "also", "then", "this", "that", "these", "those", "it", "its",
-        "what", "which", "who", "whom", "how", "when", "where", "why",
-        "all", "each", "every", "both", "few", "more", "most", "other",
-        "some", "such", "only", "own", "same", "we", "they", "he", "she",
-        "us", "our", "their", "your", "my", "i", "me", "you",
-        "nor", "need", "dare", "him", "his", "her", "them",
-        "any", "again", "under", "over",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+        "do", "does", "did", "will", "would", "could", "should", "may", "might", "shall", "can",
+        "of", "in", "to", "for", "with", "on", "at", "by", "from", "as", "into", "through",
+        "during", "before", "after", "above", "below", "between", "and", "but", "or", "not", "no",
+        "so", "if", "than", "too", "very", "just", "about", "also", "then", "this", "that",
+        "these", "those", "it", "its", "what", "which", "who", "whom", "how", "when", "where",
+        "why", "all", "each", "every", "both", "few", "more", "most", "other", "some", "such",
+        "only", "own", "same", "we", "they", "he", "she", "us", "our", "their", "your", "my", "i",
+        "me", "you", "nor", "need", "dare", "him", "his", "her", "them", "any", "again", "under",
+        "over",
     ]
     .into_iter()
     .collect()
@@ -64,13 +60,72 @@ static EN_STOPWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
 /// Chinese stop words.
 static ZH_STOPWORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
-        "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
-        "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
-        "会", "着", "没有", "看", "好", "自己", "这", "他", "她", "它",
-        "吗", "吧", "呢", "啊", "呀", "哦", "嗯", "嘛", "哈",
-        "怎样", "怎么", "什么", "哪", "哪个", "哪些", "为什么", "如何",
-        "可以", "能", "把", "被", "让", "给", "对", "从", "向", "跟",
-        "还", "又", "再", "已", "已经", "正在", "将", "将要",
+        "的",
+        "了",
+        "在",
+        "是",
+        "我",
+        "有",
+        "和",
+        "就",
+        "不",
+        "人",
+        "都",
+        "一",
+        "一个",
+        "上",
+        "也",
+        "很",
+        "到",
+        "说",
+        "要",
+        "去",
+        "你",
+        "会",
+        "着",
+        "没有",
+        "看",
+        "好",
+        "自己",
+        "这",
+        "他",
+        "她",
+        "它",
+        "吗",
+        "吧",
+        "呢",
+        "啊",
+        "呀",
+        "哦",
+        "嗯",
+        "嘛",
+        "哈",
+        "怎样",
+        "怎么",
+        "什么",
+        "哪",
+        "哪个",
+        "哪些",
+        "为什么",
+        "如何",
+        "可以",
+        "能",
+        "把",
+        "被",
+        "让",
+        "给",
+        "对",
+        "从",
+        "向",
+        "跟",
+        "还",
+        "又",
+        "再",
+        "已",
+        "已经",
+        "正在",
+        "将",
+        "将要",
     ]
     .into_iter()
     .collect()
@@ -291,10 +346,7 @@ mod tests {
 
     #[test]
     fn test_fts_expression_preserves_operators() {
-        let result = tokenize_fts_expression(
-            "machine AND learning",
-            CjkTokenizerMode::Auto,
-        );
+        let result = tokenize_fts_expression("machine AND learning", CjkTokenizerMode::Auto);
         assert!(result.contains("AND"));
         assert!(result.contains("machine"));
         assert!(result.contains("learning"));
@@ -326,20 +378,14 @@ mod tests {
 
     #[test]
     fn test_fts_expression_chinese() {
-        let result = tokenize_fts_expression(
-            "机器学习 AND 深度学习",
-            CjkTokenizerMode::Auto,
-        );
+        let result = tokenize_fts_expression("机器学习 AND 深度学习", CjkTokenizerMode::Auto);
         assert!(result.contains("AND"));
         assert!(result.contains("机器"));
     }
 
     #[test]
     fn test_fts_expression_strips_special_chars() {
-        let result = tokenize_fts_expression(
-            "hello! AND world?",
-            CjkTokenizerMode::Auto,
-        );
+        let result = tokenize_fts_expression("hello! AND world?", CjkTokenizerMode::Auto);
         assert!(result.contains("AND"));
         // Special chars should be stripped
         assert!(!result.contains("!"));

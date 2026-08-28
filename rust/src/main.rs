@@ -1,5 +1,8 @@
+//! CLI wiring for feature-gated indexing, search, and statistics commands.
+
+use std::cmp::Reverse;
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::Result;
@@ -130,13 +133,14 @@ fn run(cli: Cli) -> Result<()> {
     // Determine output format
     let stdout = io::stdout();
     let is_tty = stdout.is_terminal();
-    let format: Box<dyn OutputFormat> = if cli.json || matches!(cli.format, Some(FormatChoice::Json)) || !is_tty {
-        Box::new(output::json::JsonOutput)
-    } else if cli.no_color || matches!(cli.format, Some(FormatChoice::Plain)) {
-        Box::new(output::plain::PlainOutput)
-    } else {
-        Box::new(output::tty::TtyOutput::new(Vec::new()))
-    };
+    let format: Box<dyn OutputFormat> =
+        if cli.json || matches!(cli.format, Some(FormatChoice::Json)) || !is_tty {
+            Box::new(output::json::JsonOutput)
+        } else if cli.no_color || matches!(cli.format, Some(FormatChoice::Plain)) {
+            Box::new(output::plain::PlainOutput)
+        } else {
+            Box::new(output::tty::TtyOutput::new(Vec::new()))
+        };
 
     // Build config
     let mut config = TreeSearchConfig::from_env();
@@ -162,9 +166,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Commands::Search { query, path }) => {
             let request = resolve_search_request(query, fts_expression.clone(), regex)?;
             cmd_search(
-                &request.query,
-                request.fts_expression.as_deref(),
-                request.regex,
+                &request,
                 &path,
                 &config,
                 &*format,
@@ -180,9 +182,7 @@ fn run(cli: Cli) -> Result<()> {
             if let Ok(request) = request {
                 let path = path.unwrap_or_else(|| PathBuf::from("."));
                 cmd_search(
-                    &request.query,
-                    request.fts_expression.as_deref(),
-                    request.regex,
+                    &request,
                     &path,
                     &config,
                     &*format,
@@ -210,11 +210,15 @@ struct SearchRequest {
 }
 
 fn normalize_cli(mut cli: Cli) -> Cli {
-    if cli.command.is_none() && cli.fts_expression.is_some() && cli.query.is_some() && cli.path.is_none() {
+    if cli.command.is_none()
+        && cli.fts_expression.is_some()
+        && cli.query.is_some()
+        && cli.path.is_none()
+    {
         cli.path = cli.query.take().map(PathBuf::from);
     }
     if let Some(Commands::Search { query, path }) = cli.command.as_mut() {
-        if cli.fts_expression.is_some() && query.is_some() && *path == PathBuf::from(".") {
+        if cli.fts_expression.is_some() && query.is_some() && path == Path::new(".") {
             *path = PathBuf::from(query.take().unwrap());
         }
     }
@@ -249,16 +253,14 @@ fn resolve_search_request(
     anyhow::bail!("a query is required unless --fts-expression is provided")
 }
 
-fn db_path_for(root: &PathBuf) -> PathBuf {
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+fn db_path_for(root: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     canonical.join(".treesearch").join("index.db")
 }
 
 fn cmd_search(
-    query: &str,
-    fts_expression: Option<&str>,
-    regex: bool,
-    path: &PathBuf,
+    request: &SearchRequest,
+    path: &Path,
     config: &TreeSearchConfig,
     format: &dyn OutputFormat,
     verbose: u8,
@@ -273,13 +275,13 @@ fn cmd_search(
         if let Some(parent) = db.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let fts = FTS5Index::new(Some(db.to_str().unwrap()), None)?;
+        let fts = FTS5Index::with_config_path(Some(&db), config)?;
         let stats = indexer::index_directory(path, &fts, config, follow_symlinks, true)?;
         eprintln!("{}", stats);
         fts.close();
     }
 
-    let fts = FTS5Index::new(Some(db.to_str().unwrap()), None)?;
+    let fts = FTS5Index::with_config_path(Some(&db), config)?;
 
     // Load documents
     let documents = fts.load_all_documents()?;
@@ -290,7 +292,14 @@ fn cmd_search(
 
     // Search
     let start = std::time::Instant::now();
-    let mut results = search::search_with_options(query, &documents, &fts, config, fts_expression, regex)?;
+    let mut results = search::search_with_options(
+        &request.query,
+        &documents,
+        &fts,
+        config,
+        request.fts_expression.as_deref(),
+        request.regex,
+    )?;
     let search_time = start.elapsed();
 
     results.truncate(max_results);
@@ -319,20 +328,20 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_index(path: &PathBuf, config: &TreeSearchConfig, follow_symlinks: bool) -> Result<()> {
+fn cmd_index(path: &Path, config: &TreeSearchConfig, follow_symlinks: bool) -> Result<()> {
     let db = db_path_for(path);
     if let Some(parent) = db.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let fts = FTS5Index::new(Some(db.to_str().unwrap()), None)?;
+    let fts = FTS5Index::with_config_path(Some(&db), config)?;
     let stats = indexer::index_directory(path, &fts, config, follow_symlinks, true)?;
     println!("{}", stats);
     fts.close();
     Ok(())
 }
 
-fn cmd_stats(path: &PathBuf) -> Result<()> {
+fn cmd_stats(path: &Path) -> Result<()> {
     let db = db_path_for(path);
     if !db.exists() {
         eprintln!("No index found at {:?}", db);
@@ -340,7 +349,7 @@ fn cmd_stats(path: &PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let fts = FTS5Index::new(Some(db.to_str().unwrap()), None)?;
+    let fts = FTS5Index::new_path(Some(&db), None)?;
     let stats = fts.get_stats()?;
 
     println!("TreeSearch Index Statistics");
@@ -357,14 +366,15 @@ fn cmd_stats(path: &PathBuf) -> Result<()> {
 
     // File type distribution
     let docs = fts.load_all_documents()?;
-    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut type_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     for doc in &docs {
         *type_counts.entry(doc.source_type.to_string()).or_insert(0) += 1;
     }
     if !type_counts.is_empty() {
         println!("\nFile types:");
         let mut sorted: Vec<_> = type_counts.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|(source_type, count)| (Reverse(*count), source_type.clone()));
         for (stype, count) in sorted {
             println!("  {:<12} {}", stype, count);
         }
@@ -407,7 +417,12 @@ mod tests {
 
     #[test]
     fn test_search_subcommand_accepts_fts_expression() {
-        let cli = normalize_cli(Cli::parse_from(["ts", "search", "--fts-expression", "auth*"]));
+        let cli = normalize_cli(Cli::parse_from([
+            "ts",
+            "search",
+            "--fts-expression",
+            "auth*",
+        ]));
         match cli.command {
             Some(Commands::Search { query, .. }) => {
                 assert_eq!(query, None);
@@ -419,7 +434,13 @@ mod tests {
 
     #[test]
     fn test_search_subcommand_accepts_fts_expression_with_path() {
-        let cli = normalize_cli(Cli::parse_from(["ts", "search", "--fts-expression", "auth*", "src"]));
+        let cli = normalize_cli(Cli::parse_from([
+            "ts",
+            "search",
+            "--fts-expression",
+            "auth*",
+            "src",
+        ]));
         match cli.command {
             Some(Commands::Search { query, path }) => {
                 assert_eq!(query, None);

@@ -1,3 +1,5 @@
+//! Parses JSON, YAML, and TOML values into deterministic document trees.
+
 use crate::document::{Document, Node, SourceType};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -28,8 +30,7 @@ impl super::Parser for JsonParser {
             return Ok(doc);
         }
 
-        let value: Value =
-            serde_json::from_str(content).context("failed to parse JSON")?;
+        let value: Value = serde_json::from_str(content).context("failed to parse JSON")?;
         let root = value_to_node(&file_name, &value);
         doc.structure.push(root);
         doc.assign_node_ids();
@@ -97,8 +98,7 @@ impl super::Parser for TomlParser {
             return Ok(doc);
         }
 
-        let toml_value: toml::Value =
-            toml::from_str(content).context("failed to parse TOML")?;
+        let toml_value: toml::Value = toml::from_str(content).context("failed to parse TOML")?;
         let json_value = toml_to_json(&toml_value);
         let root = value_to_node(&file_name, &json_value);
         doc.structure.push(root);
@@ -145,9 +145,9 @@ fn value_to_node(title: &str, value: &Value) -> Node {
             }
         }
         Value::Array(arr) => {
-            let inner = array_to_node(title, arr);
-            node.text = inner.text;
-            node.children = inner.children;
+            let mut inner = array_to_node(title, arr);
+            node.text = std::mem::take(&mut inner.text);
+            node.children = std::mem::take(&mut inner.children);
         }
         _ => {
             node.text = format_scalar(value);
@@ -277,8 +277,8 @@ fn path_parts(path: &Path) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use crate::parser::Parser;
     use super::*;
+    use crate::parser::Parser;
 
     // --- JSON tests ---
 
@@ -480,8 +480,7 @@ mod tests {
 
     #[test]
     fn test_value_to_node_deeply_nested() {
-        let json: Value =
-            serde_json::from_str(r#"{"a": {"b": {"c": "deep"}}}"#).unwrap();
+        let json: Value = serde_json::from_str(r#"{"a": {"b": {"c": "deep"}}}"#).unwrap();
         let node = value_to_node("root", &json);
         assert_eq!(node.children[0].title, "a");
         assert_eq!(node.children[0].children[0].title, "b");
@@ -501,8 +500,7 @@ mod tests {
 
     #[test]
     fn test_yaml_to_json_roundtrip() {
-        let yaml: serde_yaml::Value =
-            serde_yaml::from_str("key: value\nnum: 42").unwrap();
+        let yaml: serde_yaml::Value = serde_yaml::from_str("key: value\nnum: 42").unwrap();
         let json = yaml_to_json(yaml);
         assert_eq!(json["key"], Value::String("value".into()));
         assert_eq!(json["num"], Value::Number(42.into()));
@@ -510,8 +508,7 @@ mod tests {
 
     #[test]
     fn test_toml_to_json_roundtrip() {
-        let toml_val: toml::Value =
-            toml::from_str("key = \"value\"\nnum = 42").unwrap();
+        let toml_val: toml::Value = toml::from_str("key = \"value\"\nnum = 42").unwrap();
         let json = toml_to_json(&toml_val);
         assert_eq!(json["key"], Value::String("value".into()));
         assert_eq!(json["num"], Value::Number(42.into()));

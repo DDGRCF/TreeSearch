@@ -1,4 +1,4 @@
-//! Indexer: parallel file discovery, parsing, and FTS5 batch insertion.
+//! Optional directory indexer with independently selectable progress reporting.
 //!
 //! Pipeline:
 //!   File Discovery (ignore crate) → Parallel Parse (rayon) → Batch Insert (FTS5)
@@ -12,6 +12,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
+#[cfg(feature = "progress")]
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use tracing::{info, warn};
@@ -29,16 +30,42 @@ fn file_fingerprint(path: &Path) -> Option<String> {
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
-        .as_secs();
+        .as_nanos();
     let size = meta.len();
     Some(format!("{}:{}", mtime, size))
 }
 
 /// Discover files respecting .gitignore and .treesearchignore.
-pub fn discover_files(root: &Path, config: &TreeSearchConfig, follow_symlinks: bool) -> Vec<PathBuf> {
+pub fn discover_files(
+    root: &Path,
+    config: &TreeSearchConfig,
+    follow_symlinks: bool,
+) -> Vec<PathBuf> {
+    discover_files_with_status(root, config, follow_symlinks).files
+}
+
+/// One bounded discovery result plus whether the whole tree was observed.
+struct FileDiscovery {
+    files: Vec<PathBuf>,
+    complete: bool,
+}
+
+/// Discovers supported files and records whether pruning evidence is complete.
+fn discover_files_with_status(
+    root: &Path,
+    config: &TreeSearchConfig,
+    follow_symlinks: bool,
+) -> FileDiscovery {
+    if config.max_dir_files == 0 {
+        return FileDiscovery {
+            files: Vec::new(),
+            complete: false,
+        };
+    }
     let parser_registry = ParserRegistry::new();
 
-    let walker = WalkBuilder::new(root)
+    let mut walker_builder = WalkBuilder::new(root);
+    walker_builder
         .follow_links(follow_symlinks)
         .hidden(true) // skip hidden files
         .git_ignore(true)
@@ -46,14 +73,17 @@ pub fn discover_files(root: &Path, config: &TreeSearchConfig, follow_symlinks: b
         .git_exclude(true)
         .add_custom_ignore_filename(".treesearchignore")
         .max_depth(None)
-        .build();
+        .sort_by_file_path(|left, right| left.cmp(right));
+    let walker = walker_builder.build();
 
     let mut files: Vec<PathBuf> = Vec::new();
+    let mut complete = true;
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
                 warn!("Walk error: {}", e);
+                complete = false;
                 continue;
             }
         };
@@ -65,11 +95,15 @@ pub fn discover_files(root: &Path, config: &TreeSearchConfig, follow_symlinks: b
             files.push(path);
         }
         if files.len() >= config.max_dir_files {
-            warn!("Reached max_dir_files limit ({}), stopping discovery", config.max_dir_files);
+            warn!(
+                "Reached max_dir_files limit ({}), stopping discovery",
+                config.max_dir_files
+            );
+            complete = false;
             break;
         }
     }
-    files
+    FileDiscovery { files, complete }
 }
 
 /// Index a directory into an FTS5 database.
@@ -83,8 +117,17 @@ pub fn index_directory(
     let start = Instant::now();
 
     // Discover files
-    let files = discover_files(root, config, follow_symlinks);
+    let discovery = discover_files_with_status(root, config, follow_symlinks);
+    let files = discovery.files;
     if files.is_empty() {
+        if discovery.complete {
+            let existing_meta = fts_index.get_all_index_meta()?;
+            for old_path in existing_meta.keys() {
+                if let Some(doc_id) = fts_index.get_doc_id_by_source_path(old_path)? {
+                    fts_index.delete_document(&doc_id)?;
+                }
+            }
+        }
         info!("No supported files found in {:?}", root);
         return Ok(IndexStats {
             files_found: 0,
@@ -133,7 +176,10 @@ pub fn index_directory(
         });
     }
 
-    // Progress bar
+    #[cfg(not(feature = "progress"))]
+    let _ = show_progress;
+
+    #[cfg(feature = "progress")]
     let pb = if show_progress {
         let pb = ProgressBar::new(to_index.len() as u64);
         pb.set_style(
@@ -147,19 +193,30 @@ pub fn index_directory(
         None
     };
 
-    // Parallel parsing
+    // Parallel parsing in a request-local pool, rather than Rayon global defaults.
     let parser_registry = ParserRegistry::new();
-    let parse_results: Vec<(PathBuf, Result<Document>)> = to_index
-        .par_iter()
-        .map(|path| {
-            let result = parse_file(&parser_registry, path);
-            if let Some(ref pb) = pb {
-                pb.inc(1);
-            }
-            (path.clone(), result)
-        })
-        .collect();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(effective_concurrency(
+            config.max_concurrency,
+            to_index.len(),
+        ))
+        .build()
+        .context("build bounded parser thread pool")?;
+    let parse_results: Vec<(PathBuf, Result<Document>)> = pool.install(|| {
+        to_index
+            .par_iter()
+            .map(|path| {
+                let result = parse_file(&parser_registry, path);
+                #[cfg(feature = "progress")]
+                if let Some(ref pb) = pb {
+                    pb.inc(1);
+                }
+                (path.clone(), result)
+            })
+            .collect()
+    });
 
+    #[cfg(feature = "progress")]
     if let Some(ref pb) = pb {
         pb.finish_with_message("Parsing complete");
     }
@@ -201,19 +258,23 @@ pub fn index_directory(
         fts_index.set_index_meta_batch(&new_meta)?;
     }
 
-    // Prune deleted files
-    let all_paths: std::collections::HashSet<String> = files
-        .iter()
-        .map(|f| f.to_string_lossy().to_string())
-        .collect();
     let mut pruned = 0;
-    for old_path in existing_meta.keys() {
-        if !all_paths.contains(old_path) {
-            if let Some(doc_id) = fts_index.get_doc_id_by_source_path(old_path)? {
-                fts_index.delete_document(&doc_id)?;
-                pruned += 1;
+    if discovery.complete {
+        // Only a complete walk proves that a previously indexed path was deleted.
+        let all_paths: std::collections::HashSet<String> = files
+            .iter()
+            .map(|f| f.to_string_lossy().to_string())
+            .collect();
+        for old_path in existing_meta.keys() {
+            if !all_paths.contains(old_path) {
+                if let Some(doc_id) = fts_index.get_doc_id_by_source_path(old_path)? {
+                    fts_index.delete_document(&doc_id)?;
+                    pruned += 1;
+                }
             }
         }
+    } else {
+        warn!("Skipping stale-document pruning because discovery was incomplete");
     }
     if pruned > 0 {
         info!("Pruned {} deleted documents from index", pruned);
@@ -235,10 +296,14 @@ pub fn index_directory(
     })
 }
 
+/// Clamps parser parallelism to a non-zero value and the current work size.
+fn effective_concurrency(configured: usize, work_items: usize) -> usize {
+    configured.max(1).min(work_items.max(1))
+}
+
 /// Parse a single file using the parser registry.
 fn parse_file(registry: &ParserRegistry, path: &Path) -> Result<Document> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {:?}", path))?;
+    let content = fs::read_to_string(path).with_context(|| format!("Failed to read {:?}", path))?;
     registry
         .parse_content(path, &content)?
         .ok_or_else(|| anyhow::anyhow!("No parser found for {:?}", path))
@@ -260,8 +325,77 @@ impl std::fmt::Display for IndexStats {
         write!(
             f,
             "Indexed: {} files ({} nodes) in {}ms | {} skipped, {} failed",
-            self.files_indexed, self.nodes_indexed, self.duration_ms,
-            self.files_skipped, self.files_failed,
+            self.files_indexed,
+            self.nodes_indexed,
+            self.duration_ms,
+            self.files_skipped,
+            self.files_failed,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{discover_files_with_status, effective_concurrency};
+    use crate::config::TreeSearchConfig;
+
+    #[test]
+    fn parser_concurrency_is_bounded_by_policy_and_work() {
+        for (configured, work_items, expected) in [(0, 0, 1), (0, 5, 1), (2, 5, 2), (20, 5, 5)] {
+            assert_eq!(
+                effective_concurrency(configured, work_items),
+                expected,
+                "configured={configured}, work_items={work_items}"
+            );
+        }
+    }
+
+    #[cfg(feature = "parser-markdown")]
+    #[test]
+    fn bounded_discovery_is_marked_incomplete() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.md"), "# A").unwrap();
+        std::fs::write(directory.path().join("b.md"), "# B").unwrap();
+        let config = TreeSearchConfig {
+            max_dir_files: 1,
+            ..TreeSearchConfig::default()
+        };
+
+        let discovery = discover_files_with_status(directory.path(), &config, false);
+        assert_eq!(discovery.files.len(), 1);
+        assert!(!discovery.complete);
+        assert!(discovery.files[0].ends_with("a.md"));
+    }
+
+    #[cfg(feature = "parser-markdown")]
+    #[test]
+    fn incomplete_discovery_never_prunes_and_complete_empty_walk_does() {
+        use super::index_directory;
+        use crate::engine::fts::FTS5Index;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("a.md");
+        let second = directory.path().join("b.md");
+        std::fs::write(&first, "# A").unwrap();
+        std::fs::write(&second, "# B").unwrap();
+        let index = FTS5Index::new(None, None).unwrap();
+        let full_config = TreeSearchConfig {
+            max_dir_files: 10,
+            ..TreeSearchConfig::default()
+        };
+        index_directory(directory.path(), &index, &full_config, false, false).unwrap();
+        assert_eq!(index.get_stats().unwrap().document_count, 2);
+
+        let bounded_config = TreeSearchConfig {
+            max_dir_files: 1,
+            ..full_config.clone()
+        };
+        index_directory(directory.path(), &index, &bounded_config, false, false).unwrap();
+        assert_eq!(index.get_stats().unwrap().document_count, 2);
+
+        std::fs::remove_file(first).unwrap();
+        std::fs::remove_file(second).unwrap();
+        index_directory(directory.path(), &index, &full_config, false, false).unwrap();
+        assert_eq!(index.get_stats().unwrap().document_count, 0);
     }
 }

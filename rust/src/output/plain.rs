@@ -17,6 +17,9 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
     if s.width() <= max_width {
         return s.to_string();
     }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
     let mut width = 0;
     let mut result = String::new();
     for ch in s.chars() {
@@ -69,7 +72,11 @@ impl OutputFormat for PlainOutput {
                 let crumb_len = result.breadcrumb.len();
                 for (j, crumb) in result.breadcrumb.iter().enumerate() {
                     let is_last = j == crumb_len - 1;
-                    let prefix = if is_last { "  └── " } else { "  ├── " };
+                    let prefix = if is_last {
+                        "  └── "
+                    } else {
+                        "  ├── "
+                    };
                     let truncated = truncate_to_width(crumb, MAX_WIDTH.saturating_sub(8));
                     out.push_str(&format!("{}{}\n", prefix, truncated));
                 }
@@ -226,5 +233,12 @@ mod tests {
         let truncated = truncate_to_width(&long, 50);
         assert!(truncated.ends_with("..."));
         assert!(truncated.width() <= 50);
+    }
+
+    #[test]
+    fn test_truncate_to_tiny_width_never_exceeds_limit() {
+        for width in 0..=3 {
+            assert_eq!(truncate_to_width("知识库", width).width(), width);
+        }
     }
 }
