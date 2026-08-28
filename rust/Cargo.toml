@@ -1,16 +1,20 @@
-# Change note: forbid unsafe code and keep optional SQLite limited to APIs TreeSearch actually uses.
+# Change note: publish the maintained fork as `rtreesearch` while preserving the `treesearch` Rust crate name.
 [package]
-name = "treesearch"
-version = "1.1.1"
+name = "rtreesearch"
+version = "1.1.2"
 edition = "2021"
 description = "Structure-aware document search library and optional CLI over hierarchical document trees."
 license = "Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/DDGRCF/TreeSearch"
-documentation = "https://docs.rs/treesearch"
+documentation = "https://docs.rs/rtreesearch"
 repository = "https://github.com/DDGRCF/TreeSearch"
 keywords = ["search", "fts5", "bm25", "tree", "cli"]
 categories = ["command-line-utilities", "text-processing"]
+
+[lib]
+name = "treesearch"
+path = "src/lib.rs"
 
 [[bin]]
 name = "ts"

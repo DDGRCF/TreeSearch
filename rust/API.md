@@ -68,19 +68,19 @@ request-local directory-parser pool and is clamped to the number of files.
 Pure in-memory Markdown/plain-text embedding:
 
 ```toml
-treesearch = { git = "https://github.com/DDGRCF/TreeSearch.git", default-features = false, features = ["parser-markdown", "parser-plaintext"] }
+treesearch = { package = "rtreesearch", version = "1.1.2", default-features = false, features = ["parser-markdown", "parser-plaintext"] }
 ```
 
 SQLite using a host/system library:
 
 ```toml
-treesearch = { git = "https://github.com/DDGRCF/TreeSearch.git", default-features = false, features = ["sqlite-fts"] }
+treesearch = { package = "rtreesearch", version = "1.1.2", default-features = false, features = ["sqlite-fts"] }
 ```
 
 Self-contained SQLite:
 
 ```toml
-treesearch = { git = "https://github.com/DDGRCF/TreeSearch.git", default-features = false, features = ["sqlite-bundled"] }
+treesearch = { package = "rtreesearch", version = "1.1.2", default-features = false, features = ["sqlite-bundled"] }
 ```
 
 `sqlite-fts` requires a linkable system `sqlite3` with FTS5 enabled.

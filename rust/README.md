@@ -1,6 +1,6 @@
 # TreeSearch Rust Library and CLI
 
-`treesearch` is a fast, structure-aware document search library and optional CLI built with Rust.
+`rtreesearch` is a fast, structure-aware document search library and optional CLI built with Rust.
 It indexes files into a local SQLite FTS5 database and searches by document
 structure instead of chunking text into arbitrary fragments.
 
@@ -13,7 +13,7 @@ For an application that constructs authorized documents itself and only parses
 Markdown/plain text, use the dependency-minimal profile:
 
 ```toml
-treesearch = { git = "https://github.com/DDGRCF/TreeSearch.git", default-features = false, features = ["parser-markdown", "parser-plaintext"] }
+treesearch = { package = "rtreesearch", version = "1.1.2", default-features = false, features = ["parser-markdown", "parser-plaintext"] }
 ```
 
 This profile keeps the in-memory flat/tree ranking engine, document model,
@@ -109,7 +109,7 @@ ts --help
 **Cargo**
 
 ```bash
-cargo install treesearch
+cargo install rtreesearch
 ts --help
 ```
 
